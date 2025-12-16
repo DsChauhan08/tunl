@@ -1,0 +1,350 @@
+CC := gcc
+CXX := g++
+INSTALL := install
+
+SRC_DIR := src
+BUILD_DIR := build
+BIN_DIR := bin
+OBJ_DIR := $(BUILD_DIR)/obj
+
+TARGET := spf-server
+INSTALL_PREFIX := /usr/local
+INSTALL_BIN := $(INSTALL_PREFIX)/bin
+
+C_SOURCES := $(wildcard $(SRC_DIR)/*.c)
+CXX_SOURCES := $(filter-out $(SRC_DIR)/spf_esp32.cpp, $(wildcard $(SRC_DIR)/*.cpp))
+
+C_OBJECTS := $(C_SOURCES:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+CXX_OBJECTS := $(CXX_SOURCES:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
+OBJECTS := $(C_OBJECTS) $(CXX_OBJECTS)
+
+DEPS := $(OBJECTS:.o=.d)
+
+COMMON_CFLAGS := -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration
+COMMON_CXXFLAGS := -Wall -Wextra -Wpedantic -std=c++11
+
+DEBUG_CFLAGS := -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
+DEBUG_CXXFLAGS := -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
+DEBUG_LDFLAGS := -fsanitize=address -fsanitize=undefined
+
+RELEASE_CFLAGS := -O3 -march=native -flto -DNDEBUG
+RELEASE_CXXFLAGS := -O3 -march=native -flto -DNDEBUG -fno-exceptions
+RELEASE_LDFLAGS := -flto -s
+
+LIBS := -lssl -lcrypto -lmicrohttpd -ljansson -lpthread
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+    PLATFORM := linux
+    LIBS += -lrt
+endif
+ifeq ($(UNAME_S),Darwin)
+    PLATFORM := macos
+endif
+ifeq ($(UNAME_S),FreeBSD)
+    PLATFORM := freebsd
+endif
+
+BUILD_MODE ?= release
+
+ifeq ($(BUILD_MODE),debug)
+    CFLAGS := $(COMMON_CFLAGS) $(DEBUG_CFLAGS)
+    CXXFLAGS := $(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS)
+    LDFLAGS := $(DEBUG_LDFLAGS)
+    TARGET := $(TARGET)-debug
+else
+    CFLAGS := $(COMMON_CFLAGS) $(RELEASE_CFLAGS)
+    CXXFLAGS := $(COMMON_CXXFLAGS) $(RELEASE_CXXFLAGS)
+    LDFLAGS := $(RELEASE_LDFLAGS)
+endif
+
+CFLAGS += -MMD -MP
+CXXFLAGS += -MMD -MP
+
+.PHONY: all clean install uninstall check help debug release
+
+all: $(BIN_DIR)/$(TARGET)
+
+debug:
+	@$(MAKE) BUILD_MODE=debug all
+
+release:
+	@$(MAKE) BUILD_MODE=release all
+
+$(BIN_DIR)/$(TARGET): $(OBJECTS) | $(BIN_DIR)
+	@echo "Linking $@..."
+	@$(CXX) $(OBJECTS) -o $@ $(LDFLAGS) $(LIBS)
+	@echo "Build complete: $@"
+	@ls -lh $@
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
+	@echo "Compiling $<..."
+	@$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BIN_DIR) $(OBJ_DIR):
+	@mkdir -p $@
+
+install: $(BIN_DIR)/$(TARGET)
+	@echo "Installing $(TARGET) to $(INSTALL_BIN)..."
+	@$(INSTALL) -d $(INSTALL_BIN)
+	@$(INSTALL) -m 755 $(BIN_DIR)/$(TARGET) $(INSTALL_BIN)/$(TARGET)
+	@echo "Installation complete!"
+	@echo ""
+	@echo "To run: $(INSTALL_BIN)/$(TARGET)"
+	@echo "Or add $(INSTALL_PREFIX)/bin to PATH"
+
+uninstall:
+	@echo "Removing $(INSTALL_BIN)/$(TARGET)..."
+	@rm -f $(INSTALL_BIN)/$(TARGET)
+	@echo "Uninstall complete!"
+
+install-service: install
+	@echo "Installing systemd service..."
+	@if [ ! -f /etc/systemd/system/spf.service ]; then \
+		echo "[Unit]" > /tmp/spf.service; \
+		echo "Description=SPF Network Forwarder" >> /tmp/spf.service; \
+		echo "After=network.target" >> /tmp/spf.service; \
+		echo "" >> /tmp/spf.service; \
+		echo "[Service]" >> /tmp/spf.service; \
+		echo "Type=simple" >> /tmp/spf.service; \
+		echo "User=spf" >> /tmp/spf.service; \
+		echo "Group=spf" >> /tmp/spf.service; \
+		echo "Environment=\"SPF_AUTH_TOKEN=CHANGE_ME\"" >> /tmp/spf.service; \
+		echo "ExecStart=$(INSTALL_BIN)/$(TARGET)" >> /tmp/spf.service; \
+		echo "Restart=on-failure" >> /tmp/spf.service; \
+		echo "RestartSec=5s" >> /tmp/spf.service; \
+		echo "" >> /tmp/spf.service; \
+		echo "[Install]" >> /tmp/spf.service; \
+		echo "WantedBy=multi-user.target" >> /tmp/spf.service; \
+		sudo $(INSTALL) -m 644 /tmp/spf.service /etc/systemd/system/spf.service; \
+		rm /tmp/spf.service; \
+		echo "Service file created. Remember to:"; \
+		echo "  1. Create spf user: sudo useradd -r -s /bin/false spf"; \
+		echo "  2. Edit auth token: sudo systemctl edit spf"; \
+		echo "  3. Enable service: sudo systemctl enable spf"; \
+		echo "  4. Start service: sudo systemctl start spf"; \
+	else \
+		echo "Service file already exists at /etc/systemd/system/spf.service"; \
+	fi
+
+uninstall-service:
+	@echo "Removing systemd service..."
+	@sudo systemctl stop spf 2>/dev/null || true
+	@sudo systemctl disable spf 2>/dev/null || true
+	@sudo rm -f /etc/systemd/system/spf.service
+	@sudo systemctl daemon-reload
+	@echo "Service removed!"
+
+check-deps:
+	@echo "Checking dependencies..."
+	@which $(CC) >/dev/null 2>&1 || (echo "ERROR: $(CC) not found" && exit 1)
+	@which $(CXX) >/dev/null 2>&1 || (echo "ERROR: $(CXX) not found" && exit 1)
+	@echo "  ✓ Compiler: $(CC), $(CXX)"
+	@pkg-config --exists libssl 2>/dev/null || (echo "ERROR: libssl-dev not installed" && exit 1)
+	@echo "  ✓ OpenSSL"
+	@pkg-config --exists libcrypto 2>/dev/null || (echo "ERROR: libssl-dev not installed" && exit 1)
+	@echo "  ✓ libcrypto"
+	@pkg-config --exists libmicrohttpd 2>/dev/null || (echo "ERROR: libmicrohttpd-dev not installed" && exit 1)
+	@echo "  ✓ libmicrohttpd"
+	@pkg-config --exists jansson 2>/dev/null || (echo "ERROR: libjansson-dev not installed" && exit 1)
+	@echo "  ✓ jansson"
+	@echo ""
+	@echo "All dependencies satisfied!"
+
+install-deps-debian:
+	@echo "Installing dependencies for Debian/Ubuntu..."
+	sudo apt-get update
+	sudo apt-get install -y \
+		build-essential \
+		libssl-dev \
+		libmicrohttpd-dev \
+		libjansson-dev \
+		pkg-config
+	@echo "Dependencies installed!"
+
+install-deps-redhat:
+	@echo "Installing dependencies for RedHat/CentOS/Fedora..."
+	sudo yum install -y \
+		gcc gcc-c++ make \
+		openssl-devel \
+		libmicrohttpd-devel \
+		jansson-devel \
+		pkgconfig
+	@echo "Dependencies installed!"
+
+install-deps-arch:
+	@echo "Installing dependencies for Arch Linux..."
+	sudo pacman -S --needed \
+		base-devel \
+		openssl \
+		libmicrohttpd \
+		jansson
+	@echo "Dependencies installed!"
+
+install-deps-macos:
+	@echo "Installing dependencies for macOS..."
+	brew install \
+		openssl \
+		libmicrohttpd \
+		jansson
+	@echo "Dependencies installed!"
+
+test: $(BIN_DIR)/$(TARGET)
+	@echo "Running basic tests..."
+	@echo "Test 1: Check binary exists"
+	@test -f $(BIN_DIR)/$(TARGET) && echo "  ✓ Binary exists" || (echo "  ✗ Binary missing" && exit 1)
+	@echo "Test 2: Check binary is executable"
+	@test -x $(BIN_DIR)/$(TARGET) && echo "  ✓ Binary is executable" || (echo "  ✗ Not executable" && exit 1)
+	@echo "Test 3: Check dependencies"
+	@ldd $(BIN_DIR)/$(TARGET) >/dev/null 2>&1 && echo "  ✓ Dependencies OK" || echo "  ⚠ Check dependencies"
+	@echo ""
+	@echo "All tests passed!"
+
+valgrind: debug
+	@echo "Running valgrind memory check..."
+	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \
+		$(BIN_DIR)/$(TARGET)
+
+docker-build:
+	@echo "Building Docker image..."
+	docker build -t spf:latest .
+
+docker-run:
+	@echo "Running SPF in Docker..."
+	docker run -d \
+		-p 9000:9000 \
+		-p 8080:8080 \
+		-e SPF_AUTH_TOKEN=$$(openssl rand -hex 32) \
+		--name spf \
+		spf:latest
+
+docker-stop:
+	docker stop spf || true
+	docker rm spf || true
+
+bench: $(BIN_DIR)/$(TARGET)
+	@echo "Running benchmark..."
+	@echo "Starting SPF server in background..."
+	@SPF_AUTH_TOKEN=test $(BIN_DIR)/$(TARGET) &
+	@sleep 2
+	@echo "Running wrk benchmark (requires wrk to be installed)..."
+	@wrk -t4 -c100 -d10s http://localhost:8080/health 2>/dev/null || \
+		echo "Install wrk for benchmarking: apt-get install wrk"
+	@killall $(TARGET) 2>/dev/null || true
+
+format:
+	@echo "Formatting code with clang-format..."
+	@find $(SRC_DIR) -name "*.c" -o -name "*.cpp" -o -name "*.h" | \
+		xargs clang-format -i -style="{BasedOnStyle: LLVM, IndentWidth: 4}"
+	@echo "Formatting complete!"
+
+lint:
+	@echo "Linting code with clang-tidy..."
+	@find $(SRC_DIR) -name "*.c" -o -name "*.cpp" | \
+		xargs clang-tidy --checks='-*,readability-*,performance-*'
+
+analyze:
+	@echo "Running static analysis..."
+	@scan-build $(MAKE) clean all
+
+clean:
+	@echo "Cleaning build artifacts..."
+	@rm -rf $(BUILD_DIR) $(BIN_DIR)
+	@echo "Clean complete!"
+
+distclean: clean
+	@echo "Removing all generated files..."
+	@rm -f $(DEPS)
+	@echo "Distclean complete!"
+
+cross-arm:
+	@echo "Cross-compiling for ARM..."
+	@$(MAKE) CC=arm-linux-gnueabihf-gcc CXX=arm-linux-gnueabihf-g++ TARGET=spf-server-arm
+
+cross-aarch64:
+	@echo "Cross-compiling for ARM64..."
+	@$(MAKE) CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ TARGET=spf-server-aarch64
+
+cross-windows:
+	@echo "Cross-compiling for Windows..."
+	@$(MAKE) CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+		TARGET=spf-server.exe \
+		LIBS="-lws2_32 -lssl -lcrypto"
+
+info:
+	@echo "SPF Build Configuration"
+	@echo "======================="
+	@echo "Platform:         $(PLATFORM)"
+	@echo "Build Mode:       $(BUILD_MODE)"
+	@echo "C Compiler:       $(CC)"
+	@echo "C++ Compiler:     $(CXX)"
+	@echo "C Flags:          $(CFLAGS)"
+	@echo "C++ Flags:        $(CXXFLAGS)"
+	@echo "Linker Flags:     $(LDFLAGS)"
+	@echo "Libraries:        $(LIBS)"
+	@echo "Target:           $(TARGET)"
+	@echo "Install Prefix:   $(INSTALL_PREFIX)"
+	@echo ""
+	@echo "Source Files:"
+	@echo "  C:    $(C_SOURCES)"
+	@echo "  C++: $(CXX_SOURCES)"
+	@echo ""
+	@echo "Object Files:"
+	@echo "  $(OBJECTS)"
+
+help:
+	@echo "SPF - Simple Port Forwarder Makefile"
+	@echo ""
+	@echo "Build Targets:"
+	@echo "  make                    - Build release version (default)"
+	@echo "  make debug             - Build debug version with sanitizers"
+	@echo "  make release           - Build optimized release version"
+	@echo ""
+	@echo "Installation:"
+	@echo "  make install           - Install to $(INSTALL_PREFIX)/bin"
+	@echo "  make uninstall         - Remove from $(INSTALL_PREFIX)/bin"
+	@echo "  make install-service - Install systemd service"
+	@echo "  make uninstall-service - Remove systemd service"
+	@echo ""
+	@echo "Dependencies:"
+	@echo "  make check-deps           - Check if all dependencies are installed"
+	@echo "  make install-deps-debian - Install deps on Debian/Ubuntu"
+	@echo "  make install-deps-redhat - Install deps on RedHat/CentOS/Fedora"
+	@echo "  make install-deps-arch    - Install deps on Arch Linux"
+	@echo "  make install-deps-macos   - Install deps on macOS"
+	@echo ""
+	@echo "Testing:"
+	@echo "  make test              - Run basic tests"
+	@echo "  make valgrind          - Run with valgrind (memory check)"
+	@echo "  make bench             - Run benchmark"
+	@echo ""
+	@echo "Code Quality:"
+	@echo "  make format            - Format code with clang-format"
+	@echo "  make lint              - Lint code with clang-tidy"
+	@echo "  make analyze           - Static analysis with scan-build"
+	@echo ""
+	@echo "Docker:"
+	@echo "  make docker-build      - Build Docker image"
+	@echo "  make docker-run        - Run in Docker container"
+	@echo "  make docker-stop       - Stop Docker container"
+	@echo ""
+	@echo "Cross-compilation:"
+	@echo "  make cross-arm         - Cross-compile for ARM"
+	@echo "  make cross-aarch64     - Cross-compile for ARM64"
+	@echo "  make cross-windows     - Cross-compile for Windows"
+	@echo ""
+	@echo "Maintenance:"
+	@echo "  make clean             - Remove build artifacts"
+	@echo "  make distclean         - Remove all generated files"
+	@echo "  make info              - Show build configuration"
+	@echo "  make help              - Show this help message"
+
+-include $(DEPS)
+
+.DEFAULT_GOAL := all
+.SUFFIXES:
+.DELETE_ON_ERROR:
