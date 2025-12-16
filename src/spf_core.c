@@ -30,11 +30,11 @@ int spf_add_rule(spf_state_t* state, const spf_rule_t* rule) {
         return -1; // No space
     }
     
-    // Finding any kind of empty slot or matching rule_id
+    // find slot or id
     uint32_t idx = state->rule_count;
     for (uint32_t i = 0; i < SPF_MAX_RULES; i++) {
         if (state->rules[i].listen_port == 0 || 
-            state->rules[i].rule_id == rule->rule_id) {
+            state->rules[i].id == rule->id) {
             idx = i;
             break;
         }
@@ -49,7 +49,7 @@ int spf_add_rule(spf_state_t* state, const spf_rule_t* rule) {
     return 0;
 }
 
-// Checking if this ip address is blocked or not
+// check blk
 bool spf_is_blocked(spf_state_t* state, const char* ip) {
     uint64_t now = SPF_MILLIS() / 1000;
     
@@ -59,7 +59,7 @@ bool spf_is_blocked(spf_state_t* state, const char* ip) {
             if (state->trackers[i].blocked && state->trackers[i].block_until > now) {
                 return true;
             }
-            // Unblock if time expired
+            // unblk
             if (state->trackers[i].blocked && state->trackers[i].block_until <= now) {
                 state->trackers[i].blocked = false;
                 state->trackers[i].count = 0;
@@ -75,7 +75,7 @@ bool spf_is_blocked(spf_state_t* state, const char* ip) {
 bool spf_register_attempt(spf_state_t* state, const char* ip) {
     uint64_t now = SPF_MILLIS() / 1000;
     
-    // trying to find existing tracker or empty slot
+    // find trk or slot
     int32_t idx = -1;
     int32_t empty_idx = -1;
     

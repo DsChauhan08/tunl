@@ -31,7 +31,7 @@ RELEASE_CFLAGS := -O3 -march=native -flto -DNDEBUG
 RELEASE_CXXFLAGS := -O3 -march=native -flto -DNDEBUG -fno-exceptions
 RELEASE_LDFLAGS := -flto -s
 
-LIBS := -lssl -lcrypto -lmicrohttpd -ljansson -lpthread
+LIBS := -lssl -lcrypto -lpthread
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
@@ -148,10 +148,6 @@ check-deps:
 	@echo "  ✓ OpenSSL"
 	@pkg-config --exists libcrypto 2>/dev/null || (echo "ERROR: libssl-dev not installed" && exit 1)
 	@echo "  ✓ libcrypto"
-	@pkg-config --exists libmicrohttpd 2>/dev/null || (echo "ERROR: libmicrohttpd-dev not installed" && exit 1)
-	@echo "  ✓ libmicrohttpd"
-	@pkg-config --exists jansson 2>/dev/null || (echo "ERROR: libjansson-dev not installed" && exit 1)
-	@echo "  ✓ jansson"
 	@echo ""
 	@echo "All dependencies satisfied!"
 
@@ -161,8 +157,6 @@ install-deps-debian:
 	sudo apt-get install -y \
 		build-essential \
 		libssl-dev \
-		libmicrohttpd-dev \
-		libjansson-dev \
 		pkg-config
 	@echo "Dependencies installed!"
 
@@ -171,8 +165,6 @@ install-deps-redhat:
 	sudo yum install -y \
 		gcc gcc-c++ make \
 		openssl-devel \
-		libmicrohttpd-devel \
-		jansson-devel \
 		pkgconfig
 	@echo "Dependencies installed!"
 
@@ -180,17 +172,13 @@ install-deps-arch:
 	@echo "Installing dependencies for Arch Linux..."
 	sudo pacman -S --needed \
 		base-devel \
-		openssl \
-		libmicrohttpd \
-		jansson
+		openssl
 	@echo "Dependencies installed!"
 
 install-deps-macos:
 	@echo "Installing dependencies for macOS..."
 	brew install \
-		openssl \
-		libmicrohttpd \
-		jansson
+		openssl
 	@echo "Dependencies installed!"
 
 test: $(BIN_DIR)/$(TARGET)

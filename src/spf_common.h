@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 #if defined(ESP32) || defined(ESP_PLATFORM)
     #define SPF_PLATFORM_ESP32
@@ -17,15 +18,20 @@
 #endif
 
 // limits
-#define SPF_MAX_CONNECTIONS 32
-#define SPF_MAX_RULES 8
-#define SPF_BUFFER_SIZE 2048
-#define SPF_MAX_IP_TRACKERS 256
+#define SPF_MAX_CONNECTIONS 1024
+#define SPF_MAX_RULES 64
+#define SPF_BUFFER_SIZE 4096
+#define SPF_MAX_IP_TRACKERS 1024
 
 #define SPF_AUTH_TOKEN_SIZE 64
-#define SPF_SCAN_THRESHOLD 5
+#define SPF_SCAN_THRESHOLD 10
 #define SPF_SCAN_WINDOW_SEC 30
 #define SPF_BLOCK_FIRST_SEC 600
+
+// ctrl consts
+#define SPF_CMD_MAX_LEN 256
+#define SPF_RES_MAX_LEN 1024
+#define SPF_CTRL_PORT_DEFAULT 8081
 
 typedef struct {
     uint16_t listen_port;
@@ -34,7 +40,9 @@ typedef struct {
     bool enabled;
     uint32_t max_connections;
     uint64_t rate_bps;
-    uint8_t rule_id;
+    uint32_t id;
+    bool active;
+    pthread_t thread_id; // thread handle
 } spf_rule_t;
 
 
@@ -83,8 +91,13 @@ typedef struct {
     uint32_t active_connections;
     uint64_t next_conn_id;
     bool running;
+    pthread_mutex_t lock; // global lock
 } spf_state_t;
 
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 void spf_init(spf_state_t* state);
 int spf_add_rule(spf_state_t* state, const spf_rule_t* rule);
@@ -92,5 +105,9 @@ bool spf_is_blocked(spf_state_t* state, const char* ip);
 bool spf_register_attempt(spf_state_t* state, const char* ip);
 void spf_token_bucket_init(spf_token_bucket_t* tb, uint64_t rate, double burst);
 uint64_t spf_token_bucket_consume(spf_token_bucket_t* tb, uint64_t want);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif 
