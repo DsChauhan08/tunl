@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -233,6 +236,8 @@ typedef struct {
 extern "C" {
 #endif
 
+extern spf_state_t g_state;
+
 void spf_init(spf_state_t* state);
 void spf_shutdown(spf_state_t* state);
 
@@ -278,6 +283,24 @@ uint64_t spf_time_ms(void);
 uint64_t spf_time_sec(void);
 void spf_random_bytes(uint8_t* buf, size_t len);
 uint32_t spf_hash_ip(const char* ip);
+
+// TLS
+typedef struct ssl_st SSL;
+typedef struct ssl_ctx_st SSL_CTX;
+
+int tls_init(const char* cert, const char* key);
+void tls_cleanup(void);
+SSL_CTX* tls_get_server_ctx(void);
+SSL_CTX* tls_get_client_ctx(void);
+SSL* tls_accept(int fd);
+SSL* tls_connect(int fd, const char* hostname);
+ssize_t tls_read(SSL* ssl, void* buf, size_t len);
+ssize_t tls_write(SSL* ssl, const void* buf, size_t len);
+void tls_close(SSL* ssl);
+int tls_set_client_cert(const char* cert, const char* key);
+int tls_require_client_cert(void);
+const char* tls_get_cipher(SSL* ssl);
+const char* tls_get_version(SSL* ssl);
 
 #ifdef __cplusplus
 }

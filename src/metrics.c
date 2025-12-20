@@ -39,6 +39,7 @@ int metrics_format(spf_state_t* state, char* buf, size_t len) {
             metrics[i].name, metrics[i].type);
     }
     
+    pthread_mutex_lock(&state->stats_lock);
     written += snprintf(buf + written, len - written,
         "spf_connections_active %u\n"
         "spf_connections_total %lu\n"
@@ -54,6 +55,7 @@ int metrics_format(spf_state_t* state, char* buf, size_t len) {
         state->blocked_count,
         state->rule_count,
         uptime);
+    pthread_mutex_unlock(&state->stats_lock);
     
     for (int i = 0; i < SPF_MAX_RULES; i++) {
         if (state->rules[i].active) {

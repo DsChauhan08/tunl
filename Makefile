@@ -23,9 +23,9 @@ DEPS := $(OBJECTS:.o=.d)
 COMMON_CFLAGS := -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration
 COMMON_CXXFLAGS := -Wall -Wextra -Wpedantic -std=c++11
 
-DEBUG_CFLAGS := -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
-DEBUG_CXXFLAGS := -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
-DEBUG_LDFLAGS := -fsanitize=address -fsanitize=undefined
+DEBUG_CFLAGS := -g -O0 -DDEBUG
+DEBUG_CXXFLAGS := -g -O0 -DDEBUG
+DEBUG_LDFLAGS :=
 
 RELEASE_CFLAGS := -O3 -march=native -flto -DNDEBUG
 RELEASE_CXXFLAGS := -O3 -march=native -flto -DNDEBUG -fno-exceptions

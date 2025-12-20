@@ -106,7 +106,9 @@ int config_load(spf_state_t* state, const char* path) {
                 spf_rule_t rule = {0};
                 uint8_t rnd[4];
                 spf_random_bytes(rnd, 4);
-                rule.id = (*(uint32_t*)rnd) % 90000 + 10000;
+                uint32_t r;
+                memcpy(&r, rnd, 4);
+                rule.id = r % 90000 + 10000;
                 rule.listen_port = atoi(val);
                 rule.enabled = true;
                 rule.active = true;
@@ -115,6 +117,10 @@ int config_load(spf_state_t* state, const char* path) {
                 pthread_mutex_lock(&state->lock);
                 for (int i = 0; i < SPF_MAX_RULES; i++) {
                     if (!state->rules[i].active) {
+                        // Safe copy avoiding mutex overwrite (similar to core.c fix)
+                        if (state->rules[i].active || state->rules[i].id != 0) {
+                            pthread_mutex_destroy(&state->rules[i].lock);
+                        }
                         memcpy(&state->rules[i], &rule, sizeof(rule));
                         pthread_mutex_init(&state->rules[i].lock, NULL);
                         current_rule = &state->rules[i];

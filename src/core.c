@@ -21,7 +21,7 @@ uint64_t spf_time_ms(void) {
 #else
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
 #endif
 }
 
@@ -30,17 +30,26 @@ uint64_t spf_time_sec(void) {
 }
 
 void spf_random_bytes(uint8_t* buf, size_t len) {
-#ifdef SPF_PLATFORM_ESP32
-    for (size_t i = 0; i < len; i++) buf[i] = random() & 0xFF;
-#else
+    #ifdef SPF_PLATFORM_ESP32
+    for (size_t i = 0; i < len; i++) buf[i] = (uint8_t)random();
+    #else
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd >= 0) {
-        read(fd, buf, len);
+        if (read(fd, buf, len) == (ssize_t)len) {
+            close(fd);
+            return;
+        }
         close(fd);
-    } else {
-        for (size_t i = 0; i < len; i++) buf[i] = rand() & 0xFF;
     }
-#endif
+    
+    // Fallback: use thread-local state for rand_r
+    static __thread unsigned int seed = 0;
+    if (seed == 0) seed = (unsigned int)time(NULL) ^ (unsigned int)pthread_self();
+    
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = (uint8_t)rand_r(&seed);
+    }
+    #endif
 }
 
 uint32_t spf_hash_ip(const char* ip) {
@@ -134,9 +143,28 @@ int spf_add_rule(spf_state_t* state, const spf_rule_t* rule) {
         return -1;
     }
     
-    memcpy(&state->rules[idx], rule, sizeof(spf_rule_t));
-    pthread_mutex_init(&state->rules[idx].lock, NULL);
+    // If this slot was previously used (rules are not zeroed on del), 
+    // we should technically check if we need to destroy old mutexes, 
+    // but typically we just re-init. The correct way is to not memcpy over the mutex.
+    // However, since we are reusing the *storage*, we must be careful.
+    // Let's copy field by field or memcpy and then re-init (which implementations usually tolerate if destroyed).
+    // Safer: Destroy old locks first if the rule ID was valid.
+    if (state->rules[idx].active || state->rules[idx].id != 0) {
+        pthread_mutex_destroy(&state->rules[idx].lock);
+        for (int i = 0; i < SPF_MAX_BACKENDS; i++) {
+            pthread_mutex_destroy(&state->rules[idx].backends[i].lock);
+        }
+    }
     
+    // safe copy excluding lock would be tedious, so we assume re-init is our path
+    // but memcpy overwrites the mutex state which is UB.
+    // We will zero the destination first? No, that also wipes mutex memory.
+    // Correct C: don't overwrite the mutex object with memcpy if it's active.
+    // Since we destroyed it above, the memory is now "garbage" / "free to use".
+    memcpy(&state->rules[idx], rule, sizeof(spf_rule_t));
+    
+    // Now init valid mutexes
+    pthread_mutex_init(&state->rules[idx].lock, NULL);
     for (int i = 0; i < state->rules[idx].backend_count; i++) {
         pthread_mutex_init(&state->rules[idx].backends[i].lock, NULL);
     }
@@ -158,6 +186,18 @@ int spf_del_rule(spf_state_t* state, uint32_t rule_id) {
             state->rules[i].active = false;
             state->rules[i].enabled = false;
             state->rule_count--;
+            
+            // We should destroy the mutexes to be clean, but we hold the main lock.
+            // Destroying them is fine as long as no one else is using them.
+            // Since active is false, no one should find this rule anymore (guarded by state->lock).
+            pthread_mutex_destroy(&state->rules[i].lock);
+            for (int j = 0; j < state->rules[i].backend_count; j++) {
+                pthread_mutex_destroy(&state->rules[i].backends[j].lock);
+            }
+            
+            // Mark ID as 0 to indicate free slot clearly?
+            // state->rules[i].id = 0; // We keep ID for logging/history maybe?
+            
             pthread_mutex_unlock(&state->lock);
             spf_log(SPF_LOG_INFO, "rule %u deleted", rule_id);
             return 0;
@@ -507,7 +547,9 @@ int spf_lb_select_backend(spf_rule_t* rule, const char* client_ip) {
             if (total > 0) {
                 uint8_t rnd[4];
                 spf_random_bytes(rnd, 4);
-                uint32_t r = (*(uint32_t*)rnd) % total;
+                uint32_t r;
+                memcpy(&r, rnd, 4);
+                r %= total;
                 uint32_t acc = 0;
                 for (int i = 0; i < rule->backend_count; i++) {
                     if (rule->backends[i].state == SPF_BACKEND_UP) {

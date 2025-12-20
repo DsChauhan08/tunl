@@ -175,6 +175,8 @@ int lb_add_backend(spf_rule_t* rule, const char* host, uint16_t port, uint16_t w
     return idx;
 }
 
+// Dead code: implementation unsafe (mutex copy) and unused
+/*
 int lb_remove_backend(spf_rule_t* rule, uint8_t idx) {
     if (idx >= rule->backend_count) return -1;
     
@@ -188,6 +190,7 @@ int lb_remove_backend(spf_rule_t* rule, uint8_t idx) {
     pthread_mutex_unlock(&rule->lock);
     return 0;
 }
+*/
 
 int lb_get_healthy_count(spf_rule_t* rule) {
     int count = 0;

@@ -106,9 +106,7 @@ void health_check_backend(spf_state_t* state, spf_rule_t* rule, uint8_t idx) {
 void* health_worker(void* arg) {
     spf_rule_t* rule = (spf_rule_t*)arg;
     
-    spf_state_t* state = NULL;
-    extern spf_state_t g_state;
-    state = &g_state;
+    spf_state_t* state = &g_state;
     
     spf_log(SPF_LOG_INFO, "health: worker started for rule %u", rule->id);
     
