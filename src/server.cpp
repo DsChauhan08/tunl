@@ -182,7 +182,9 @@ void* health_worker(void* arg) {
             int fd = socket(AF_INET, SOCK_STREAM, 0);
             if (fd < 0) continue;
             
-            struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+            struct timeval tv;
+            tv.tv_sec = 2;
+            tv.tv_usec = 0;
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             
@@ -340,6 +342,15 @@ void* listener_thread(void* arg) {
         spf_event_push(&g_state, SPF_EVENT_CONN_OPEN, cli_ip, ntohs(cli_addr.sin_port), rule->id, b->host);
         
         session_t* sess = (session_t*)malloc(sizeof(session_t));
+        if (!sess) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.connections[conn_idx].active = false;
+            g_state.active_conns--;
+            pthread_mutex_unlock(&g_state.stats_lock);
+            close(tgt_fd);
+            close(cli_fd);
+            continue;
+        }
         sess->client_fd = cli_fd;
         sess->target_fd = tgt_fd;
         sess->client_ssl = NULL;
@@ -354,6 +365,10 @@ void* listener_thread(void* arg) {
             SSL_set_fd(sess->client_ssl, cli_fd);
             if (SSL_accept(sess->client_ssl) <= 0) {
                 SSL_free(sess->client_ssl);
+                pthread_mutex_lock(&g_state.stats_lock);
+                g_state.connections[conn_idx].active = false;
+                g_state.active_conns--;
+                pthread_mutex_unlock(&g_state.stats_lock);
                 close(cli_fd);
                 close(tgt_fd);
                 free(sess);
@@ -512,10 +527,18 @@ void handle_ctrl(int fd) {
                 }
                 
                 if (rule.backend_count > 0) {
-                    spf_add_rule(&g_state, &rule);
-                    pthread_create(&g_state.rules[g_state.rule_count - 1].listen_thread, NULL, listener_thread, &g_state.rules[g_state.rule_count - 1]);
-                    pthread_detach(g_state.rules[g_state.rule_count - 1].listen_thread);
-                    snprintf(resp, sizeof(resp), "OK rule %u added\n", rule.id);
+                    if (spf_add_rule(&g_state, &rule) == 0) {
+                        spf_rule_t* added = spf_get_rule(&g_state, rule.id);
+                        if (added) {
+                            pthread_create(&added->listen_thread, NULL, listener_thread, added);
+                            pthread_detach(added->listen_thread);
+                            snprintf(resp, sizeof(resp), "OK rule %u added\n", rule.id);
+                        } else {
+                            snprintf(resp, sizeof(resp), "ERR internal error\n");
+                        }
+                    } else {
+                        snprintf(resp, sizeof(resp), "ERR failed to add rule\n");
+                    }
                 } else {
                     snprintf(resp, sizeof(resp), "ERR bad backend format\n");
                 }

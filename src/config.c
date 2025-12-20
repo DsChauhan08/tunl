@@ -110,6 +110,7 @@ int config_load(spf_state_t* state, const char* path) {
                 for (int i = 0; i < SPF_MAX_RULES; i++) {
                     if (!state->rules[i].active) {
                         memcpy(&state->rules[i], &rule, sizeof(rule));
+                        pthread_mutex_init(&state->rules[i].lock, NULL);
                         current_rule = &state->rules[i];
                         state->rule_count++;
                         break;
@@ -120,6 +121,7 @@ int config_load(spf_state_t* state, const char* path) {
             else if (strcmp(key, "backend") == 0 && current_rule) {
                 if (current_rule->backend_count < SPF_MAX_BACKENDS) {
                     parse_backend(val, &current_rule->backends[current_rule->backend_count]);
+                    pthread_mutex_init(&current_rule->backends[current_rule->backend_count].lock, NULL);
                     current_rule->backend_count++;
                 }
             }

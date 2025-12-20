@@ -124,7 +124,6 @@ int siem_export_logs(spf_state_t* state, int fd, uint32_t count) {
 }
 
 bool siem_detect_scan(spf_state_t* state, const char* ip) {
-    int slot;
     spf_tracker_t* t = NULL;
     
     pthread_mutex_lock(&state->lock);

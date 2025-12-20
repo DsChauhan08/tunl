@@ -52,10 +52,17 @@ uint32_t spf_hash_ip(const char* ip) {
 static const char* g_log_prefix[] = {"DBG", "INF", "WRN", "ERR", "SEC"};
 
 void spf_log(spf_log_level_t level, const char* fmt, ...) {
+    if (level < 0 || level > SPF_LOG_SECURITY) level = SPF_LOG_INFO;
+    
     time_t now = time(NULL);
-    struct tm* t = localtime(&now);
+    struct tm tm_buf;
+    struct tm* t = localtime_r(&now, &tm_buf);
     char ts[32];
-    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
+    if (t) {
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
+    } else {
+        snprintf(ts, sizeof(ts), "(time error)");
+    }
     
     fprintf(stderr, "[%s] [%s] ", ts, g_log_prefix[level]);
     va_list args;
@@ -162,11 +169,14 @@ int spf_del_rule(spf_state_t* state, uint32_t rule_id) {
 }
 
 spf_rule_t* spf_get_rule(spf_state_t* state, uint32_t rule_id) {
+    pthread_mutex_lock(&state->lock);
     for (int i = 0; i < SPF_MAX_RULES; i++) {
         if (state->rules[i].active && state->rules[i].id == rule_id) {
+            pthread_mutex_unlock(&state->lock);
             return &state->rules[i];
         }
     }
+    pthread_mutex_unlock(&state->lock);
     return NULL;
 }
 
