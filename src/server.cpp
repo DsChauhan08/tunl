@@ -263,14 +263,16 @@ void* listener_thread(void* arg) {
         char cli_ip[SPF_IP_MAX_LEN];
         inet_ntop(AF_INET, &cli_addr.sin_addr, cli_ip, sizeof(cli_ip));
         
-        if (spf_is_blocked(&g_state, cli_ip)) {
-            close(cli_fd);
-            continue;
-        }
-        
-        if (!spf_register_attempt(&g_state, cli_ip)) {
-            close(cli_fd);
-            continue;
+        if (g_state.config.security.enabled) {
+            if (spf_is_blocked(&g_state, cli_ip)) {
+                close(cli_fd);
+                continue;
+            }
+            
+            if (!spf_register_attempt(&g_state, cli_ip)) {
+                close(cli_fd);
+                continue;
+            }
         }
         
         if (g_state.config.security.enabled && spf_geoip_is_blocked(&g_state, cli_ip)) {
@@ -678,14 +680,16 @@ void daemonize(void) {
 }
 
 int main(int argc, char** argv) {
+    const char* config_path = "spf.conf";
     char* bind_addr = NULL;
     char* token = NULL;
     char* cert = NULL;
     char* key = NULL;
-    int port = SPF_CTRL_PORT_DEFAULT;
+    int port = 0; // 0 means not set via CLI
     bool daemon_mode = false;
     
     static struct option opts[] = {
+        {"config", required_argument, 0, 'C'},
         {"admin-bind", required_argument, 0, 'b'},
         {"admin-port", required_argument, 0, 'p'},
         {"token", required_argument, 0, 't'},
@@ -697,8 +701,9 @@ int main(int argc, char** argv) {
     };
     
     int c;
-    while ((c = getopt_long(argc, argv, "b:p:t:c:k:dh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "C:b:p:t:c:k:dh", opts, NULL)) != -1) {
         switch (c) {
+            case 'C': config_path = optarg; break;
             case 'b': bind_addr = optarg; break;
             case 'p': port = atoi(optarg); break;
             case 't': token = optarg; break;
@@ -709,6 +714,7 @@ int main(int argc, char** argv) {
                 printf("SPF v%s - Production Network Forwarder\n\n", SPF_VERSION);
                 printf("Usage: %s [options]\n\n", argv[0]);
                 printf("Options:\n");
+                printf("  -C, --config <path>    Config file (default: spf.conf)\n");
                 printf("  -b, --admin-bind <ip>  Bind address (default: 127.0.0.1)\n");
                 printf("  -p, --admin-port <n>   Control port (default: 8081)\n");
                 printf("  -t, --token <str>      Auth token (required for remote)\n");
@@ -724,11 +730,28 @@ int main(int argc, char** argv) {
     
     spf_init(&g_state);
     
+    // Load config first
+    if (spf_load_config(&g_state, config_path) < 0) {
+        // If default config fails, just warn (unless specific config was requested)
+        if (strcmp(config_path, "spf.conf") != 0) {
+            fprintf(stderr, "Error: cannot load config file %s\n", config_path);
+            return 1;
+        } else {
+             // For default, maybe it doesn't exist yet, which is fine
+        }
+    }
+
     if (bind_addr) strncpy(g_state.config.admin.bind_addr, bind_addr, SPF_IP_MAX_LEN - 1);
     if (token) strncpy(g_state.config.admin.token, token, SPF_TOKEN_MAX - 1);
     if (cert) strncpy(g_state.config.admin.cert_path, cert, SPF_PATH_MAX - 1);
     if (key) strncpy(g_state.config.admin.key_path, key, SPF_PATH_MAX - 1);
-    g_state.config.admin.port = port;
+    
+    // Override port if set via CLI
+    if (port > 0) {
+        g_state.config.admin.port = port;
+    } else if (g_state.config.admin.port == 0) {
+        g_state.config.admin.port = SPF_CTRL_PORT_DEFAULT;
+    }
     
     if (cert && key) {
         if (tls_init(cert, key) == 0) {

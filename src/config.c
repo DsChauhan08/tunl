@@ -29,7 +29,7 @@ static int parse_backend(const char* str, spf_backend_t* b) {
     return -1;
 }
 
-int config_load(spf_state_t* state, const char* path) {
+int spf_load_config(spf_state_t* state, const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) {
         spf_log(SPF_LOG_ERROR, "config: cannot open %s", path);
@@ -62,6 +62,8 @@ int config_load(spf_state_t* state, const char* path) {
         *eq = '\0';
         char* key = trim(s);
         char* val = trim(eq + 1);
+        
+        spf_log(SPF_LOG_DEBUG, "config: section=[%s] key=[%s] val=[%s]", section, key, val);
         
         if (strcmp(section, "admin") == 0) {
             if (strcmp(key, "bind") == 0) {
@@ -157,13 +159,13 @@ int config_load(spf_state_t* state, const char* path) {
     return 0;
 }
 
-int config_reload(spf_state_t* state) {
+int spf_reload_config(spf_state_t* state) {
     if (state->config.config_path[0] == '\0') {
         return -1;
     }
     
     spf_log(SPF_LOG_INFO, "config: reloading...");
-    return config_load(state, state->config.config_path);
+    return spf_load_config(state, state->config.config_path);
 }
 
 int config_save(spf_state_t* state, const char* path) {
