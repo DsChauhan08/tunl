@@ -254,4 +254,4 @@ make info
 
 ## License
 
-GPL-3.0
+GPL-2.0
