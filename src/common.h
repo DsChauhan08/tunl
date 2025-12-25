@@ -21,7 +21,13 @@
     #define SPF_PLATFORM_GENERIC
 #endif
 
-#define SPF_VERSION "2.0.0"
+#define SPF_VERSION "2.1.0"
+
+// Protocol types - UDP support (rinetd/socat pain point: no UDP)
+typedef enum {
+    SPF_PROTO_TCP = 0,
+    SPF_PROTO_UDP
+} spf_proto_t;
 
 #define SPF_MAX_CONNECTIONS 4096
 #define SPF_MAX_RULES 128
@@ -115,8 +121,10 @@ typedef struct {
     bool active;
     bool tls_terminate;
     spf_lb_algo_t lb_algo;
+    spf_proto_t protocol;          // TCP or UDP
     spf_backend_t backends[SPF_MAX_BACKENDS];
     uint8_t backend_count;
+    uint32_t drain_timeout_sec;   // Connection draining timeout (cloud LB feature)
     uint32_t rr_index;
     uint64_t rate_bps;
     uint32_t max_conns;
@@ -183,6 +191,8 @@ typedef struct {
     bool ddos_protection;
     bool proxy_proto;
     bool anomaly_detection;
+    char hooks_dir[SPF_PATH_MAX];  // Custom security hooks directory
+    char access_log[SPF_PATH_MAX]; // Access log file path
 } spf_security_cfg_t;
 
 typedef struct {
@@ -304,6 +314,41 @@ int tls_set_client_cert(const char* cert, const char* key);
 int tls_require_client_cert(void);
 const char* tls_get_cipher(SSL* ssl);
 const char* tls_get_version(SSL* ssl);
+
+// Hook system (Linux-way extensibility)
+typedef enum {
+    SPF_HOOK_ON_CONNECT = 0,
+    SPF_HOOK_ON_DISCONNECT,
+    SPF_HOOK_ON_BLOCK,
+    SPF_HOOK_ON_HEALTH,
+    SPF_HOOK_COUNT
+} spf_hook_type_t;
+
+void spf_hooks_init(void);
+void spf_hooks_cleanup(void);
+void spf_hooks_set_dir(const char* dir);
+int spf_hooks_add(spf_hook_type_t type, const char* path, bool async, uint32_t timeout_ms);
+int spf_hooks_autodiscover(void);
+int spf_hooks_run(spf_hook_type_t type, const char* client_ip, uint16_t client_port,
+                  uint32_t rule_id, const char* backend_ip, uint16_t backend_port);
+int spf_hook_on_connect(const char* client_ip, uint16_t client_port,
+                        uint32_t rule_id, const char* backend_ip, uint16_t backend_port);
+void spf_hook_on_disconnect(const char* client_ip, uint16_t client_port,
+                            uint32_t rule_id, const char* backend_ip, uint16_t backend_port);
+void spf_hook_on_block(const char* client_ip, uint32_t rule_id, const char* reason);
+void spf_hook_on_health(const char* backend_ip, uint16_t backend_port,
+                        uint32_t rule_id, bool is_up);
+int spf_hooks_get_info(char* buf, size_t len);
+
+// DNS hostname resolution (rinetd pain point: only IPs)
+int spf_resolve_hostname(const char* hostname, char* ip_out, size_t ip_len);
+
+// Access logging (cloud LB feature)
+void spf_access_log(const char* client_ip, uint16_t client_port, uint32_t rule_id,
+                   const char* backend, uint64_t bytes_in, uint64_t bytes_out,
+                   uint64_t duration_ms, int status);
+int spf_access_log_init(const char* path);
+void spf_access_log_close(void);
 
 #ifdef __cplusplus
 }

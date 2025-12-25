@@ -174,7 +174,7 @@ info:
 	@echo "Sources: $(C_SOURCES) $(CXX_SOURCES)"
 
 help:
-	@echo "SPF v2.0 - Production Network Forwarder"
+	@echo "SPF v2.1 - Production Network Forwarder"
 	@echo ""
 	@echo "Build:"
 	@echo "  make           - Build release"
@@ -193,6 +193,12 @@ help:
 	@echo "  make cross-arm      - ARM 32bit"
 	@echo "  make cross-aarch64  - ARM 64bit"
 	@echo "  make cross-windows  - Windows"
+	@echo ""
+	@echo "New in v2.1:"
+	@echo "  - One-liner mode: spf -f 8080:backend:80"
+	@echo "  - Custom hooks: scripts in hooks.d"
+	@echo "  - Access logs: JSON format like cloud LBs"
+	@echo "  - SIGHUP reload: no restart needed"
 
 -include $(DEPS)
 

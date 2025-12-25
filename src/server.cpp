@@ -22,6 +22,7 @@
 spf_state_t g_state;
 static int g_ctrl_fd = -1;
 static volatile sig_atomic_t g_shutdown = 0;
+static volatile sig_atomic_t g_reload = 0;  // SIGHUP reload flag
 
 typedef struct {
     int client_fd;
@@ -35,8 +36,11 @@ typedef struct {
 } session_t;
 
 void sig_handler(int sig) {
-    (void)sig;
-    g_shutdown = 1;
+    if (sig == SIGHUP) {
+        g_reload = 1;  // Hot reload config
+    } else {
+        g_shutdown = 1;
+    }
 }
 
 int send_proxy_proto_v2(int fd, struct sockaddr_in* src, struct sockaddr_in* dst) {
@@ -147,6 +151,22 @@ void* session_thread(void* arg) {
     close(s->target_fd);
     
     spf_lb_conn_end(s->rule, s->backend_idx);
+    
+    // Access logging (cloud LB feature)
+    char cli_ip[SPF_IP_MAX_LEN];
+    inet_ntop(AF_INET, &s->client_addr.sin_addr, cli_ip, sizeof(cli_ip));
+    char backend_info[128];
+    snprintf(backend_info, sizeof(backend_info), "%s:%u", 
+             s->rule->backends[s->backend_idx].host, 
+             s->rule->backends[s->backend_idx].port);
+    uint64_t duration = (spf_time_sec() - g_state.connections[s->conn_idx].start_time) * 1000;
+    spf_access_log(cli_ip, ntohs(s->client_addr.sin_port), s->rule->id,
+                   backend_info, bytes_in, bytes_out, duration, 200);
+    
+    // Disconnect hook (custom security)
+    spf_hook_on_disconnect(cli_ip, ntohs(s->client_addr.sin_port), s->rule->id,
+                          s->rule->backends[s->backend_idx].host,
+                          s->rule->backends[s->backend_idx].port);
     
     pthread_mutex_lock(&g_state.stats_lock);
     g_state.total_bytes_in += bytes_in;
@@ -278,6 +298,35 @@ void* listener_thread(void* arg) {
         
         if (g_state.config.security.enabled && spf_geoip_is_blocked(&g_state, cli_ip)) {
             spf_event_push(&g_state, SPF_EVENT_GEOBLOCK, cli_ip, ntohs(cli_addr.sin_port), rule->id, "geo blocked");
+            if (rule_counted) {
+                pthread_mutex_lock(&rule->lock);
+                if (rule->active_conns > 0) rule->active_conns--;
+                pthread_mutex_unlock(&rule->lock);
+                rule_counted = false;
+            }
+            close(cli_fd);
+            continue;
+        }
+        
+        // Custom security hook - Linux-way extensibility
+        // Script returns: 0=allow, 1=block, 2=rate_limit
+        int hook_result = spf_hook_on_connect(cli_ip, ntohs(cli_addr.sin_port), 
+                                              rule->id, NULL, 0);
+        if (hook_result == 1) {
+            spf_event_push(&g_state, SPF_EVENT_BLOCKED, cli_ip, ntohs(cli_addr.sin_port), 
+                          rule->id, "hook blocked");
+            spf_hook_on_block(cli_ip, rule->id, "custom_hook");
+            if (rule_counted) {
+                pthread_mutex_lock(&rule->lock);
+                if (rule->active_conns > 0) rule->active_conns--;
+                pthread_mutex_unlock(&rule->lock);
+                rule_counted = false;
+            }
+            close(cli_fd);
+            continue;
+        } else if (hook_result == 2) {
+            spf_event_push(&g_state, SPF_EVENT_RATE_LIMITED, cli_ip, ntohs(cli_addr.sin_port),
+                          rule->id, "hook rate_limit");
             if (rule_counted) {
                 pthread_mutex_lock(&rule->lock);
                 if (rule->active_conns > 0) rule->active_conns--;
@@ -480,6 +529,8 @@ void handle_ctrl(int fd) {
                 "  UNBLOCK <ip>       - unblock ip\n"
                 "  LOGS [n]           - recent events\n"
                 "  METRICS            - prometheus\n"
+                "  HOOKS              - show custom hooks\n"
+                "  RELOAD             - hot reload config\n"
                 "  QUIT               - close\n");
         }
         else if (strncmp(buf, "STATUS", 6) == 0) {
@@ -665,6 +716,16 @@ void handle_ctrl(int fd) {
                 g_state.blocked_count,
                 g_state.rule_count);
         }
+        else if (strncmp(buf, "HOOKS", 5) == 0) {
+            spf_hooks_get_info(resp, sizeof(resp));
+        }
+        else if (strncmp(buf, "RELOAD", 6) == 0) {
+            if (spf_reload_config(&g_state) == 0) {
+                snprintf(resp, sizeof(resp), "OK config reloaded\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR reload failed\n");
+            }
+        }
         else {
             snprintf(resp, sizeof(resp), "ERR unknown cmd\n");
         }
@@ -740,6 +801,9 @@ int main(int argc, char** argv) {
     char* key = NULL;
     int port = 0; // 0 means not set via CLI
     bool daemon_mode = false;
+    char* forward_spec = NULL;  // One-liner mode: "8080:backend:80"
+    char* hooks_dir = NULL;
+    char* access_log_path = NULL;
     
     static struct option opts[] = {
         {"config", required_argument, 0, 'C'},
@@ -749,12 +813,15 @@ int main(int argc, char** argv) {
         {"cert", required_argument, 0, 'c'},
         {"key", required_argument, 0, 'k'},
         {"daemon", no_argument, 0, 'd'},
+        {"forward", required_argument, 0, 'f'},  // One-liner mode
+        {"hooks-dir", required_argument, 0, 'H'},
+        {"access-log", required_argument, 0, 'A'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     
     int c;
-    while ((c = getopt_long(argc, argv, "C:b:p:t:c:k:dh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "C:b:p:t:c:k:df:H:A:h", opts, NULL)) != -1) {
         switch (c) {
             case 'C': config_path = optarg; break;
             case 'b': bind_addr = optarg; break;
@@ -763,18 +830,27 @@ int main(int argc, char** argv) {
             case 'c': cert = optarg; break;
             case 'k': key = optarg; break;
             case 'd': daemon_mode = true; break;
+            case 'f': forward_spec = optarg; break;
+            case 'H': hooks_dir = optarg; break;
+            case 'A': access_log_path = optarg; break;
             case 'h':
                 printf("SPF v%s - Production Network Forwarder\n\n", SPF_VERSION);
                 printf("Usage: %s [options]\n\n", argv[0]);
                 printf("Options:\n");
-                printf("  -C, --config <path>    Config file (default: spf.conf)\n");
-                printf("  -b, --admin-bind <ip>  Bind address (default: 127.0.0.1)\n");
-                printf("  -p, --admin-port <n>   Control port (default: 8081)\n");
-                printf("  -t, --token <str>      Auth token (required for remote)\n");
-                printf("  -c, --cert <path>      TLS certificate\n");
-                printf("  -k, --key <path>       TLS private key\n");
-                printf("  -d, --daemon           Run as daemon\n");
-                printf("  -h, --help             Show this help\n");
+                printf("  -C, --config <path>      Config file (default: spf.conf)\n");
+                printf("  -b, --admin-bind <ip>    Bind address (default: 127.0.0.1)\n");
+                printf("  -p, --admin-port <n>     Control port (default: 8081)\n");
+                printf("  -t, --token <str>        Auth token (required for remote)\n");
+                printf("  -c, --cert <path>        TLS certificate\n");
+                printf("  -k, --key <path>         TLS private key\n");
+                printf("  -d, --daemon             Run as daemon\n");
+                printf("  -f, --forward <spec>     Quick forward: listen:backend:port (socat-like)\n");
+                printf("  -H, --hooks-dir <path>   Custom security hooks directory\n");
+                printf("  -A, --access-log <path>  Access log file path\n");
+                printf("  -h, --help               Show this help\n");
+                printf("\nOne-liner mode (like socat but simpler):\n");
+                printf("  %s -f 8080:myserver.com:80\n", argv[0]);
+                printf("  %s -f 443:10.0.0.1:8443 -c cert.pem -k key.pem\n", argv[0]);
                 return 0;
         }
     }
@@ -782,6 +858,18 @@ int main(int argc, char** argv) {
     if (daemon_mode) daemonize();
     
     spf_init(&g_state);
+    
+    // Initialize hook system
+    spf_hooks_init();
+    if (hooks_dir) {
+        spf_hooks_set_dir(hooks_dir);
+    }
+    spf_hooks_autodiscover();
+    
+    // Initialize access logging
+    if (access_log_path) {
+        spf_access_log_init(access_log_path);
+    }
     
     // Load config first
     if (spf_load_config(&g_state, config_path) < 0) {
@@ -812,6 +900,55 @@ int main(int argc, char** argv) {
             spf_log(SPF_LOG_INFO, "tls enabled");
         }
     }
+    
+    // One-liner forward mode (socat pain point: complex syntax)
+    if (forward_spec) {
+        int listen_port;
+        char backend_host[128];
+        int backend_port;
+        
+        if (sscanf(forward_spec, "%d:%127[^:]:%d", &listen_port, backend_host, &backend_port) == 3) {
+            spf_rule_t rule;
+            memset(&rule, 0, sizeof(rule));
+            rule.id = 1;
+            rule.listen_port = listen_port;
+            rule.enabled = true;
+            rule.rate_bps = 100 * 1024 * 1024;
+            rule.max_conns = 512;
+            rule.accept_rate = 200;
+            spf_bucket_init(&rule.accept_bucket, rule.accept_rate, 2.0);
+            rule.lb_algo = SPF_LB_ROUNDROBIN;
+            rule.tls_terminate = (cert && key);
+            
+            // Resolve hostname to IP if needed
+            char resolved_ip[SPF_IP_MAX_LEN];
+            if (spf_resolve_hostname(backend_host, resolved_ip, sizeof(resolved_ip)) == 0) {
+                strncpy(rule.backends[0].host, resolved_ip, SPF_IP_MAX_LEN - 1);
+            } else {
+                strncpy(rule.backends[0].host, backend_host, SPF_IP_MAX_LEN - 1);
+            }
+            rule.backends[0].port = backend_port;
+            rule.backends[0].weight = 1;
+            rule.backends[0].state = SPF_BACKEND_UP;
+            rule.backend_count = 1;
+            
+            if (spf_add_rule(&g_state, &rule) == 0) {
+                spf_rule_t* added = spf_get_rule(&g_state, rule.id);
+                if (added) {
+                    pthread_create(&added->listen_thread, NULL, listener_thread, added);
+                    pthread_detach(added->listen_thread);
+                    spf_log(SPF_LOG_INFO, "one-liner: forwarding :%d -> %s:%d", 
+                           listen_port, rule.backends[0].host, backend_port);
+                }
+            } else {
+                spf_log(SPF_LOG_ERROR, "failed to add forward rule");
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "Invalid forward spec. Use: listen_port:backend_host:backend_port\n");
+            return 1;
+        }
+    }
 
     bool bind_is_loopback = strcmp(g_state.config.admin.bind_addr, "127.0.0.1") == 0 ||
                             strcmp(g_state.config.admin.bind_addr, "::1") == 0;
@@ -824,6 +961,7 @@ int main(int argc, char** argv) {
     
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGHUP, sig_handler);  // Hot reload config
     signal(SIGPIPE, SIG_IGN);
     
     if (!daemon_mode) {
@@ -837,6 +975,14 @@ int main(int argc, char** argv) {
     
     while (!g_shutdown && g_state.running) {
         sleep(1);
+        
+        // SIGHUP hot reload (rinetd pain point: requires restart)
+        if (g_reload) {
+            g_reload = 0;
+            spf_log(SPF_LOG_INFO, "SIGHUP received, reloading config...");
+            spf_reload_config(&g_state);
+            spf_hooks_autodiscover();  // Re-scan hooks
+        }
     }
     
     spf_log(SPF_LOG_INFO, "shutting down...");
@@ -846,6 +992,8 @@ int main(int argc, char** argv) {
     
     pthread_join(ct, NULL);
     tls_cleanup();
+    spf_access_log_close();
+    spf_hooks_cleanup();
     spf_shutdown(&g_state);
     
     return 0;
