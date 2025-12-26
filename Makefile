@@ -20,18 +20,18 @@ OBJECTS := $(C_OBJECTS) $(CXX_OBJECTS)
 
 DEPS := $(OBJECTS:.o=.d)
 
-COMMON_CFLAGS := -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration
-COMMON_CXXFLAGS := -Wall -Wextra -Wpedantic -std=c++11
+COMMON_CFLAGS ?= -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration
+COMMON_CXXFLAGS ?= -Wall -Wextra -Wpedantic -std=c++11
 
 DEBUG_CFLAGS := -g -O0 -DDEBUG
 DEBUG_CXXFLAGS := -g -O0 -DDEBUG
 DEBUG_LDFLAGS :=
 
-RELEASE_CFLAGS := -O3 -march=native -flto -DNDEBUG
-RELEASE_CXXFLAGS := -O3 -march=native -flto -DNDEBUG -fno-exceptions
-RELEASE_LDFLAGS := -flto -s
+RELEASE_CFLAGS ?= -O3 -flto -DNDEBUG
+RELEASE_CXXFLAGS ?= -O3 -flto -DNDEBUG -fno-exceptions
+RELEASE_LDFLAGS ?= -flto -s
 
-LIBS := -lssl -lcrypto -lpthread
+LIBS ?= -lssl -lcrypto -lpthread
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)

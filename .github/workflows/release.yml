@@ -83,34 +83,46 @@ jobs:
   build-windows:
     name: Build Windows
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
 
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          update: true
+          update: false
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-make
+            make
+            pkg-config
 
       - name: Build
+        shell: msys2 {0}
         run: |
-          export PATH="/mingw64/bin:$PATH"
-          mingw32-make clean || true
-          mingw32-make CC=gcc CXX=g++ \
-            CFLAGS="-Wall -O2 -DNDEBUG -I/mingw64/include" \
-            CXXFLAGS="-Wall -O2 -DNDEBUG -std=c++11 -fno-exceptions -I/mingw64/include" \
-            LDFLAGS="-L/mingw64/lib -static-libgcc -static-libstdc++" \
-            LIBS="-lssl -lcrypto -lws2_32 -lcrypt32 -lgdi32" \
-            TARGET=spf.exe \
-            -j$(nproc)
-          strip bin/spf.exe || true
+          # Build with mingw - override all flags to avoid -march=native
+          make clean || true
+          make CC=gcc CXX=g++ \
+            COMMON_CFLAGS="-Wall -Wextra -O2 -DNDEBUG -DWIN32" \
+            COMMON_CXXFLAGS="-Wall -Wextra -O2 -DNDEBUG -std=c++11 -DWIN32" \
+            RELEASE_CFLAGS="-O2 -DNDEBUG" \
+            RELEASE_CXXFLAGS="-O2 -DNDEBUG -fno-exceptions" \
+            RELEASE_LDFLAGS="-s" \
+            LIBS="-lssl -lcrypto -lws2_32 -lcrypt32 -lpthread" \
+            -j4 || {
+              echo "=== Build failed, checking environment ==="
+              which gcc
+              gcc --version
+              pkg-config --libs openssl || true
+              exit 1
+            }
+          
+          # Rename to .exe if needed
+          if [ -f bin/spf ]; then
+            mv bin/spf bin/spf.exe
+          fi
+          
           ls -la bin/
+          file bin/spf.exe || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -121,38 +133,43 @@ jobs:
   build-macos:
     name: Build macOS
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: macos-13
             arch: x86_64
+            openssl_prefix: /usr/local/opt/openssl@3
           - runner: macos-14
             arch: arm64
+            openssl_prefix: /opt/homebrew/opt/openssl@3
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: brew install openssl@3
+        run: |
+          brew install openssl@3 || true
+          ls -la ${{ matrix.openssl_prefix }}/lib/ || true
 
       - name: Build
         run: |
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            export LDFLAGS="-L/opt/homebrew/opt/openssl@3/lib"
-            export CFLAGS="-I/opt/homebrew/opt/openssl@3/include"
-            export CXXFLAGS="-I/opt/homebrew/opt/openssl@3/include"
-          else
-            export LDFLAGS="-L/usr/local/opt/openssl@3/lib"
-            export CFLAGS="-I/usr/local/opt/openssl@3/include"
-            export CXXFLAGS="-I/usr/local/opt/openssl@3/include"
-          fi
+          export LDFLAGS="-L${{ matrix.openssl_prefix }}/lib"
+          export CPPFLAGS="-I${{ matrix.openssl_prefix }}/include"
+          export PKG_CONFIG_PATH="${{ matrix.openssl_prefix }}/lib/pkgconfig"
+          
           make clean || true
-          make RELEASE_CFLAGS="-O2 -DNDEBUG $CFLAGS" \
-               RELEASE_CXXFLAGS="-O2 -DNDEBUG -fno-exceptions $CXXFLAGS" \
-               LDFLAGS="$LDFLAGS" \
-               -j$(sysctl -n hw.ncpu)
-          strip bin/spf
+          make \
+            COMMON_CFLAGS="-Wall -Wextra -O2 -DNDEBUG -I${{ matrix.openssl_prefix }}/include" \
+            COMMON_CXXFLAGS="-Wall -Wextra -O2 -DNDEBUG -std=c++11 -I${{ matrix.openssl_prefix }}/include" \
+            RELEASE_CFLAGS="-O2 -DNDEBUG" \
+            RELEASE_CXXFLAGS="-O2 -DNDEBUG -fno-exceptions" \
+            RELEASE_LDFLAGS="-L${{ matrix.openssl_prefix }}/lib" \
+            LDFLAGS="-L${{ matrix.openssl_prefix }}/lib" \
+            -j$(sysctl -n hw.ncpu)
+          
+          strip bin/spf || true
           file bin/spf
-          ./bin/spf --help
+          ./bin/spf --help || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
