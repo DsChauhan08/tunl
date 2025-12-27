@@ -2,7 +2,7 @@
 
 **Fast, secure, lightweight TCP/UDP proxy with enterprise security features.**
 
-**Beta v2.1.0** - We’re trying to build a simple, powerful alternative to rinetd, socat, Cloudflare Tunnel, and cloud LBs. Full detailed usage is now in [docs/guide.md](docs/guide.md). This README stays concise.
+**Beta v1.0.1** - We’re trying to build a simple, powerful alternative to rinetd, socat, Cloudflare Tunnel, and cloud LBs. Full detailed usage is now in [docs/guide.md](docs/guide.md). This README stays concise.
 
 ## 🚀 Cloudflare Tunnel Alternative
 
