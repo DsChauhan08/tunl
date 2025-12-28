@@ -59,12 +59,16 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           [ -z "$VERSION" ] && VERSION="1.0.1"
           
+          # RPM doesn't allow hyphens in Version - convert to tilde or dot
+          # e.g., 1.2.1-beta becomes 1.2.1~beta (tilde sorts lower than release)
+          RPM_VERSION="${VERSION//-/\~}"
+          
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
           cp bin/spf rpmbuild/SOURCES/
           
           cat > rpmbuild/SPECS/spf.spec << SPEC
           Name: spf
-          Version: $VERSION
+          Version: $RPM_VERSION
           Release: 1%{?dist}
           Summary: Simple Port Forwarder and Tunnel (Beta)
           License: GPL-2.0
