@@ -1,0 +1,146 @@
+.TH TUNL 1 "December 2024" "tunl 2.0.0" "User Commands"
+.SH NAME
+tunl \- IPv6-first self-hosting toolkit
+.SH SYNOPSIS
+.B tunl
+.I command
+.RI [ options ]
+.br
+.B tunl
+.B \-f
+.I port:host:port
+.br
+.B tunl
+.B \-\-help
+.SH DESCRIPTION
+.B tunl
+is a complete self-hosting toolkit for home servers. It provides TCP proxying,
+DNS dynamic updates, automatic TLS certificates, and connectivity diagnostics.
+.PP
+With IPv6, every device on your network has a globally routable public IP \-
+no NAT, no port forwarding, no VPS required.
+.SH COMMANDS
+.TP
+.B serve
+Start the TCP proxy server. Reads rules from config file or command line.
+.TP
+.B dns
+Manage DNS dynamic updates. Detects IPv6 prefix changes and updates DNS records.
+.TP
+.B cert
+Manage TLS certificates using ACME/Let's Encrypt.
+.TP
+.B check
+Run connectivity and reachability diagnostics.
+.TP
+.B tui
+Launch the terminal user interface dashboard.
+.SH OPTIONS
+.SS "Global Options"
+.TP
+.BR \-h ", " \-\-help
+Display help message.
+.TP
+.BR \-v ", " \-\-version
+Display version information.
+.SS "Serve Options"
+.TP
+.BR \-C ", " \-\-config " " \fIpath\fR
+Configuration file path (default: tunl.conf).
+.TP
+.BR \-f ", " \-\-forward " " \fIport:host:port\fR
+Quick forward mode: listen on first port, forward to host:port.
+.TP
+.BR \-d ", " \-\-daemon
+Run as a background daemon.
+.SS "DNS Options"
+.TP
+.BR \-\-provider " " \fIprovider\fR
+DNS provider: "cf" (Cloudflare) or "rfc2136".
+.TP
+.BR \-\-hostname " " \fIname\fR
+Hostname to update.
+.TP
+.BR \-\-token " " \fItoken\fR
+API token for DNS provider.
+.TP
+.BR \-\-monitor
+Run continuously, monitoring for IP changes.
+.SS "Cert Options"
+.TP
+.BR \-\-domain " " \fIdomain\fR
+Domain name for the certificate.
+.TP
+.BR \-\-email " " \fIemail\fR
+Contact email for Let's Encrypt.
+.TP
+.BR \-\-staging
+Use Let's Encrypt staging server (for testing).
+.SS "Check Options"
+.TP
+.BR \-\-hostname " " \fIname\fR
+Hostname to check DNS resolution for.
+.TP
+.BR \-\-port " " \fIport\fR
+Port to check for listeners (default: 443).
+.SH EXAMPLES
+Quick forward:
+.PP
+.RS
+tunl -f 8080:localhost:3000
+.RE
+.PP
+Start with config file:
+.PP
+.RS
+tunl serve -C /etc/tunl.conf -d
+.RE
+.PP
+Update DNS on Cloudflare:
+.PP
+.RS
+tunl dns --provider cf --hostname my.example.com --token API_TOKEN
+.RE
+.PP
+Get TLS certificate:
+.PP
+.RS
+tunl cert --domain my.example.com --email me@example.com
+.RE
+.PP
+Check connectivity:
+.PP
+.RS
+tunl check --hostname my.example.com --port 443
+.RE
+.PP
+Launch dashboard:
+.PP
+.RS
+tunl tui
+.RE
+.SH FILES
+.TP
+.I /etc/tunl.conf
+Default configuration file location (when installed).
+.TP
+.I /var/lib/tunl/certs/
+Certificate storage directory.
+.TP
+.I /var/lib/tunl/account.key
+ACME account key.
+.SH SIGNALS
+.TP
+.B SIGINT, SIGTERM
+Graceful shutdown.
+.TP
+.B SIGPIPE
+Ignored (handled internally).
+.SH SEE ALSO
+.BR nginx (8),
+.BR haproxy (1),
+.BR caddy (8)
+.SH AUTHOR
+Written following Linux kernel coding standards.
+.SH LICENSE
+GPL-2.0. See LICENSE file.

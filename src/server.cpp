@@ -1,6 +1,19 @@
-#ifndef SPF_PLATFORM_ESP32
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * tunl - IPv6-first TCP proxy and self-hosting toolkit
+ *
+ * Unified CLI with subcommands:
+ *   tunl serve    - Start proxy server
+ *   tunl dns      - DNS management and monitoring
+ *   tunl cert     - TLS certificate management
+ *   tunl check    - Reachability self-test
+ *   tunl tui      - Terminal dashboard
+ *
+ * Linux kernel style: minimal, correct, no bloat.
+ */
 
 #include "common.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,1210 +25,969 @@
 #include <ctype.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/select.h>
+#include <sys/epoll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <getopt.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <netdb.h>
+#include <termios.h>
 
-spf_state_t g_state;
+#define LISTEN_BACKLOG	128
+#define RECV_TIMEOUT	30
+#define CONN_TIMEOUT	5
+
+static volatile sig_atomic_t g_shutdown;
 static int g_ctrl_fd = -1;
-static volatile sig_atomic_t g_shutdown = 0;
-static volatile sig_atomic_t g_reload = 0;  // SIGHUP reload flag
 
-// Host mode state
-static bool g_upnp_enabled = false;
-static bool g_ddns_enabled = false;
+/* ============================================================================
+ * Socket Helpers
+ * ============================================================================ */
 
-typedef struct {
-    int client_fd;
-    int target_fd;
-    SSL* client_ssl;
-    SSL* target_ssl;
-    struct sockaddr_in client_addr;
-    spf_rule_t* rule;
-    uint8_t backend_idx;
-    uint32_t conn_idx;
-} session_t;
+static int set_nonblocking(int fd)
+{
+	int flags = fcntl(fd, F_GETFL, 0);
 
-// Safe port parsing with validation
-static int safe_parse_port(const char* str) {
-    if (!str || !*str) return -1;
-    char* end;
-    long val = strtol(str, &end, 10);
-    if (*end != '\0') return -1;  // Not fully numeric
-    if (val <= 0 || val > 65535) return -1;
-    return (int)val;
+	if (flags < 0)
+		return -1;
+	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-void sig_handler(int sig) {
-    if (sig == SIGHUP) {
-        g_reload = 1;  // Hot reload config
-    } else {
-        g_shutdown = 1;
-    }
+static int set_reuseaddr(int fd)
+{
+	int opt = 1;
+
+	return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 }
 
-int send_proxy_proto_v2(int fd, struct sockaddr_in* src, struct sockaddr_in* dst) {
-    uint8_t hdr[28] = {0};
-    memcpy(hdr, "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A", 12);
-    hdr[12] = 0x21;
-    hdr[13] = 0x11;
-    hdr[14] = 0x00;
-    hdr[15] = 12;
-    memcpy(&hdr[16], &src->sin_addr, 4);
-    memcpy(&hdr[20], &dst->sin_addr, 4);
-    memcpy(&hdr[24], &src->sin_port, 2);
-    memcpy(&hdr[26], &dst->sin_port, 2);
-    return send(fd, hdr, 28, 0) == 28 ? 0 : -1;
+static int set_nodelay(int fd)
+{
+	int opt = 1;
+
+	return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 }
 
-void* session_thread(void* arg) {
-    session_t* s = (session_t*)arg;
-    
-    spf_lb_conn_start(s->rule, s->backend_idx);
-    
-    int flag = 1;
-    setsockopt(s->client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    setsockopt(s->target_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    
-    spf_bucket_t bucket;
-    spf_bucket_init(&bucket, s->rule->rate_bps ? s->rule->rate_bps : 100*1024*1024, 2.0);
-    
-    uint8_t buf[SPF_BUFFER_SIZE];
-    fd_set fds;
-    struct timeval tv;
-    int maxfd = (s->client_fd > s->target_fd ? s->client_fd : s->target_fd) + 1;
-    
-    // Check for FD_SETSIZE overflow
-    if (s->client_fd >= FD_SETSIZE || s->target_fd >= FD_SETSIZE) {
-        spf_log(SPF_LOG_ERROR, "fd >= FD_SETSIZE, cannot use select");
-        close(s->client_fd);
-        close(s->target_fd);
-        spf_lb_conn_end(s->rule, s->backend_idx);
-        free(s);
-        return NULL;
-    }
-    
-    uint64_t bytes_in = 0, bytes_out = 0;
-    
-    while (!g_shutdown && g_state.running) {
-        FD_ZERO(&fds);
-        FD_SET(s->client_fd, &fds);
-        FD_SET(s->target_fd, &fds);
-        tv.tv_sec = 30;
-        tv.tv_usec = 0;
-        
-        int r = select(maxfd, &fds, NULL, NULL, &tv);
-        if (r <= 0) break;
-        
-        if (FD_ISSET(s->client_fd, &fds)) {
-            ssize_t n;
-            if (s->client_ssl) {
-                n = tls_read(s->client_ssl, buf, sizeof(buf));
-                if (n == 0) continue; // WANT_READ/WRITE
-            } else {
-                n = recv(s->client_fd, buf, sizeof(buf), 0);
-            }
-            if (n < 0) break; // Error
-            if (n == 0 && !s->client_ssl) break; // EOF (for tcp)
-            
-            uint64_t allowed = spf_bucket_consume(&bucket, n);
-            if (allowed > 0) {
-                if (s->target_ssl) {
-                    ssize_t sent = tls_write(s->target_ssl, buf, allowed);
-                    if (sent < 0) break;
-                } else {
-                    ssize_t sent = send(s->target_fd, buf, allowed, 0);
-                    if (sent < 0) break;
-                }
-                bytes_in += allowed;
-            }
-        }
-        
-        if (FD_ISSET(s->target_fd, &fds)) {
-            ssize_t n;
-            if (s->target_ssl) {
-                n = tls_read(s->target_ssl, buf, sizeof(buf));
-                if (n == 0) continue; // WANT_READ/WRITE
-            } else {
-                n = recv(s->target_fd, buf, sizeof(buf), 0);
-            }
-            if (n < 0) break;
-            if (n == 0 && !s->target_ssl) break;
-            
-            uint64_t allowed = spf_bucket_consume(&bucket, n);
-            if (allowed > 0) {
-                if (s->client_ssl) {
-                    ssize_t sent = tls_write(s->client_ssl, buf, allowed);
-                    if (sent < 0) break;
-                } else {
-                    ssize_t sent = send(s->client_fd, buf, allowed, 0);
-                    if (sent < 0) break;
-                }
-                bytes_out += allowed;
-            }
-        }
-    }
-    
-    if (s->client_ssl) { SSL_shutdown(s->client_ssl); SSL_free(s->client_ssl); }
-    if (s->target_ssl) { SSL_shutdown(s->target_ssl); SSL_free(s->target_ssl); }
-    close(s->client_fd);
-    close(s->target_fd);
-    
-    spf_lb_conn_end(s->rule, s->backend_idx);
-    
-    // Access logging (cloud LB feature)
-    char cli_ip[SPF_IP_MAX_LEN];
-    inet_ntop(AF_INET, &s->client_addr.sin_addr, cli_ip, sizeof(cli_ip));
-    char backend_info[128];
-    snprintf(backend_info, sizeof(backend_info), "%s:%u", 
-             s->rule->backends[s->backend_idx].host, 
-             s->rule->backends[s->backend_idx].port);
-    uint64_t duration = (spf_time_sec() - g_state.connections[s->conn_idx].start_time) * 1000;
-    spf_access_log(cli_ip, ntohs(s->client_addr.sin_port), s->rule->id,
-                   backend_info, bytes_in, bytes_out, duration, 200);
-    
-    // Disconnect hook (custom security)
-    spf_hook_on_disconnect(cli_ip, ntohs(s->client_addr.sin_port), s->rule->id,
-                          s->rule->backends[s->backend_idx].host,
-                          s->rule->backends[s->backend_idx].port);
-    
-    pthread_mutex_lock(&g_state.stats_lock);
-    g_state.total_bytes_in += bytes_in;
-    g_state.total_bytes_out += bytes_out;
-    if (s->conn_idx < SPF_MAX_CONNECTIONS) {
-        g_state.connections[s->conn_idx].active = false;
-        g_state.connections[s->conn_idx].bytes_in = bytes_in;
-        g_state.connections[s->conn_idx].bytes_out = bytes_out;
-    }
-    if (g_state.active_conns > 0) {
-        g_state.active_conns--;
-    }
-    pthread_mutex_unlock(&g_state.stats_lock);
+static void get_ip_string(const struct sockaddr_storage *addr,
+			  char *buf, size_t len)
+{
+	if (!addr || !buf || len < INET6_ADDRSTRLEN) {
+		if (buf && len > 0)
+			buf[0] = '\0';
+		return;
+	}
 
-    if (s->rule) {
-        pthread_mutex_lock(&s->rule->lock);
-        if (s->rule->active_conns > 0) {
-            s->rule->active_conns--;
-        }
-        pthread_mutex_unlock(&s->rule->lock);
-    }
-    
-    free(s);
-    return NULL;
+	if (addr->ss_family == AF_INET6) {
+		const struct sockaddr_in6 *s6 =
+			(const struct sockaddr_in6 *)addr;
+		inet_ntop(AF_INET6, &s6->sin6_addr, buf, (socklen_t)len);
+	} else if (addr->ss_family == AF_INET) {
+		const struct sockaddr_in *s4 =
+			(const struct sockaddr_in *)addr;
+		inet_ntop(AF_INET, &s4->sin_addr, buf, (socklen_t)len);
+	} else {
+		snprintf(buf, len, "[af%d]", addr->ss_family);
+	}
 }
 
-void* listener_thread(void* arg) {
-    spf_rule_t* rule = (spf_rule_t*)arg;
-    
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return NULL;
-    
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(rule->listen_port);
-    
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        spf_log(SPF_LOG_ERROR, "bind port %u failed: %s", rule->listen_port, strerror(errno));
-        close(fd);
-        return NULL;
-    }
-    
-    listen(fd, 256);
-    spf_log(SPF_LOG_INFO, "rule %u listening on :%u", rule->id, rule->listen_port);
-    
-    pthread_create(&rule->health_thread, NULL, spf_health_worker, rule);
-    pthread_detach(rule->health_thread);
-    
-    while (!g_shutdown && g_state.running && rule->active) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        struct timeval tv = {1, 0};
-        
-        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) continue;
-        
-        struct sockaddr_in cli_addr;
-        socklen_t cli_len = sizeof(cli_addr);
-        int cli_fd = accept(fd, (struct sockaddr*)&cli_addr, &cli_len);
-        if (cli_fd < 0) continue;
+static int create_listen_socket(uint16_t port, const char *bind_addr)
+{
+	int fd, opt;
+	struct sockaddr_in6 addr6;
+	struct sockaddr_in addr4;
 
-        pthread_mutex_lock(&g_state.stats_lock);
-        bool at_capacity = g_state.active_conns >= (SPF_MAX_CONNECTIONS - 1);
-        pthread_mutex_unlock(&g_state.stats_lock);
-        if (at_capacity) {
-            spf_log(SPF_LOG_WARN, "dropping connection: at capacity (%u active)", g_state.active_conns);
-            close(cli_fd);
-            continue;
-        }
-        
-        // Fix DoS: Set timeouts immediately to prevent slow handshake hanging the listener
-        struct timeval tv_cli = {10, 0}; // 10s timeout
-        setsockopt(cli_fd, SOL_SOCKET, SO_RCVTIMEO, &tv_cli, sizeof(tv_cli));
-        setsockopt(cli_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_cli, sizeof(tv_cli));
-        
-        char cli_ip[SPF_IP_MAX_LEN];
-        inet_ntop(AF_INET, &cli_addr.sin_addr, cli_ip, sizeof(cli_ip));
+	/* Try IPv6 dual-stack first */
+	fd = socket(AF_INET6, SOCK_STREAM, 0);
+	if (fd >= 0) {
+		set_reuseaddr(fd);
+		opt = 0;
+		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
 
-        bool rule_limit_hit = false;
-        pthread_mutex_lock(&rule->lock);
-        if (rule->max_conns && rule->active_conns >= rule->max_conns) {
-            rule_limit_hit = true;
-        } else if (rule->accept_rate) {
-            uint64_t allowed = spf_bucket_consume(&rule->accept_bucket, 1);
-            if (allowed == 0) {
-                rule_limit_hit = true;
-            }
-        }
-        if (!rule_limit_hit) {
-            rule->active_conns++;
-        }
-        pthread_mutex_unlock(&rule->lock);
+		memset(&addr6, 0, sizeof(addr6));
+		addr6.sin6_family = AF_INET6;
+		addr6.sin6_port = htons(port);
 
-        bool rule_counted = !rule_limit_hit;
-        if (rule_limit_hit) {
-            spf_event_push(&g_state, SPF_EVENT_RATE_LIMITED, cli_ip, ntohs(cli_addr.sin_port), rule->id, "rule limit");
-            close(cli_fd);
-            continue;
-        }
-        
-        if (g_state.config.security.enabled) {
-            if (spf_is_blocked(&g_state, cli_ip)) {
-                if (rule_counted) {
-                    pthread_mutex_lock(&rule->lock);
-                    if (rule->active_conns > 0) rule->active_conns--;
-                    pthread_mutex_unlock(&rule->lock);
-                    rule_counted = false;
-                }
-                close(cli_fd);
-                continue;
-            }
-            
-            if (!spf_register_attempt(&g_state, cli_ip)) {
-                if (rule_counted) {
-                    pthread_mutex_lock(&rule->lock);
-                    if (rule->active_conns > 0) rule->active_conns--;
-                    pthread_mutex_unlock(&rule->lock);
-                    rule_counted = false;
-                }
-                close(cli_fd);
-                continue;
-            }
-        }
-        
-        if (g_state.config.security.enabled && spf_geoip_is_blocked(&g_state, cli_ip)) {
-            spf_event_push(&g_state, SPF_EVENT_GEOBLOCK, cli_ip, ntohs(cli_addr.sin_port), rule->id, "geo blocked");
-            if (rule_counted) {
-                pthread_mutex_lock(&rule->lock);
-                if (rule->active_conns > 0) rule->active_conns--;
-                pthread_mutex_unlock(&rule->lock);
-                rule_counted = false;
-            }
-            close(cli_fd);
-            continue;
-        }
-        
-        // Custom security hook - Linux-way extensibility
-        // Script returns: 0=allow, 1=block, 2=rate_limit
-        int hook_result = spf_hook_on_connect(cli_ip, ntohs(cli_addr.sin_port), 
-                                              rule->id, NULL, 0);
-        if (hook_result == 1) {
-            spf_event_push(&g_state, SPF_EVENT_BLOCKED, cli_ip, ntohs(cli_addr.sin_port), 
-                          rule->id, "hook blocked");
-            spf_hook_on_block(cli_ip, rule->id, "custom_hook");
-            if (rule_counted) {
-                pthread_mutex_lock(&rule->lock);
-                if (rule->active_conns > 0) rule->active_conns--;
-                pthread_mutex_unlock(&rule->lock);
-                rule_counted = false;
-            }
-            close(cli_fd);
-            continue;
-        } else if (hook_result == 2) {
-            spf_event_push(&g_state, SPF_EVENT_RATE_LIMITED, cli_ip, ntohs(cli_addr.sin_port),
-                          rule->id, "hook rate_limit");
-            if (rule_counted) {
-                pthread_mutex_lock(&rule->lock);
-                if (rule->active_conns > 0) rule->active_conns--;
-                pthread_mutex_unlock(&rule->lock);
-                rule_counted = false;
-            }
-            close(cli_fd);
-            continue;
-        }
-        
-        int backend_idx = spf_lb_select_backend(rule, cli_ip);
-        if (backend_idx < 0) {
-            spf_log(SPF_LOG_WARN, "no healthy backend for rule %u", rule->id);
-            if (rule_counted) {
-                pthread_mutex_lock(&rule->lock);
-                if (rule->active_conns > 0) rule->active_conns--;
-                pthread_mutex_unlock(&rule->lock);
-                rule_counted = false;
-            }
-            close(cli_fd);
-            continue;
-        }
-        
-        spf_backend_t* b = &rule->backends[backend_idx];
-        
-        int tgt_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (tgt_fd < 0) {
-            if (rule_counted) {
-                pthread_mutex_lock(&rule->lock);
-                if (rule->active_conns > 0) rule->active_conns--;
-                pthread_mutex_unlock(&rule->lock);
-                rule_counted = false;
-            }
-            close(cli_fd);
-            continue;
-        }
-        
-        struct sockaddr_in tgt_addr;
-        memset(&tgt_addr, 0, sizeof(tgt_addr));
-        tgt_addr.sin_family = AF_INET;
-        tgt_addr.sin_port = htons(b->port);
-        inet_pton(AF_INET, b->host, &tgt_addr.sin_addr);
-        
-        struct timeval tv_conn = {5, 0};
-        setsockopt(tgt_fd, SOL_SOCKET, SO_RCVTIMEO, &tv_conn, sizeof(tv_conn));
-        setsockopt(tgt_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_conn, sizeof(tv_conn));
-        
-        if (connect(tgt_fd, (struct sockaddr*)&tgt_addr, sizeof(tgt_addr)) < 0) {
-            close(tgt_fd);
-            close(cli_fd);
-            if (rule_counted) {
-                pthread_mutex_lock(&rule->lock);
-                if (rule->active_conns > 0) rule->active_conns--;
-                pthread_mutex_unlock(&rule->lock);
-                rule_counted = false;
-            }
-            continue;
-        }
-        
-        if (g_state.config.security.proxy_proto) {
-            send_proxy_proto_v2(tgt_fd, &cli_addr, &tgt_addr);
-        }
-        
-        pthread_mutex_lock(&g_state.stats_lock);
-        int conn_idx = -1;
-        for (int i = 0; i < SPF_MAX_CONNECTIONS; i++) {
-            if (!g_state.connections[i].active) {
-                conn_idx = i;
-                break;
-            }
-        }
-        if (conn_idx < 0) {
-            pthread_mutex_unlock(&g_state.stats_lock);
-            close(tgt_fd);
-            close(cli_fd);
-            if (rule_counted) {
-                pthread_mutex_lock(&rule->lock);
-                if (rule->active_conns > 0) rule->active_conns--;
-                pthread_mutex_unlock(&rule->lock);
-                rule_counted = false;
-            }
-            continue;
-        }
-        
-        g_state.connections[conn_idx].active = true;
-        g_state.connections[conn_idx].id = g_state.next_conn_id++;
-        strncpy(g_state.connections[conn_idx].client_ip, cli_ip, SPF_IP_MAX_LEN - 1);
-        g_state.connections[conn_idx].client_port = ntohs(cli_addr.sin_port);
-        g_state.connections[conn_idx].rule_id = rule->id;
-        g_state.connections[conn_idx].backend_idx = backend_idx;
-        g_state.connections[conn_idx].start_time = spf_time_sec();
-        g_state.active_conns++;
-        g_state.total_conns++;
-        pthread_mutex_unlock(&g_state.stats_lock);
-        
-        spf_event_push(&g_state, SPF_EVENT_CONN_OPEN, cli_ip, ntohs(cli_addr.sin_port), rule->id, b->host);
-        
-        session_t* sess = (session_t*)calloc(1, sizeof(session_t));
-        if (!sess) {
-            spf_log(SPF_LOG_ERROR, "oom in listener");
-            close(cli_fd);
-            close(tgt_fd);
-            spf_lb_conn_end(rule, backend_idx);
-            if (rule_counted) {
-                pthread_mutex_lock(&rule->lock);
-                if (rule->active_conns > 0) rule->active_conns--;
-                pthread_mutex_unlock(&rule->lock);
-                rule_counted = false;
-            }
-            continue;
-        }
-        
-        sess->client_fd = cli_fd;
-        sess->target_fd = tgt_fd;
-        sess->client_addr = cli_addr;
-        sess->rule = rule;
-        sess->backend_idx = backend_idx;
-        sess->conn_idx = conn_idx;
-        
-        // Setup TLS
-        if (rule->tls_terminate) {
-            sess->client_ssl = tls_accept(cli_fd);
-            if (!sess->client_ssl) {
-                spf_log(SPF_LOG_ERROR, "tls accept failed");
-                close(cli_fd);
-                close(tgt_fd);
-                spf_lb_conn_end(rule, backend_idx);
-                if (rule_counted) {
-                    pthread_mutex_lock(&rule->lock);
-                    if (rule->active_conns > 0) rule->active_conns--;
-                    pthread_mutex_unlock(&rule->lock);
-                    rule_counted = false;
-                }
-                free(sess);
-                continue;
-            }
-        }
-        
-        // Connect to target (TLS if needed)
-        // ... (assume target logic is similar, kept simplistic here for brevity)
-        
-        pthread_t t;
-        pthread_create(&t, NULL, session_thread, sess);
-        pthread_detach(t);
-    }
-    
-    close(fd);
-    spf_log(SPF_LOG_INFO, "rule %u listener stopped", rule->id);
-    return NULL;
+		if (bind_addr && bind_addr[0]) {
+			if (inet_pton(AF_INET6, bind_addr, &addr6.sin6_addr) != 1) {
+				/* Try IPv4-mapped */
+				struct in_addr v4;
+
+				if (inet_pton(AF_INET, bind_addr, &v4) == 1) {
+					memset(&addr6.sin6_addr, 0, 10);
+					memset(((uint8_t *)&addr6.sin6_addr) + 10, 0xff, 2);
+					memcpy(((uint8_t *)&addr6.sin6_addr) + 12, &v4, 4);
+				}
+			}
+		} else {
+			addr6.sin6_addr = in6addr_any;
+		}
+
+		if (bind(fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0 &&
+		    listen(fd, LISTEN_BACKLOG) == 0)
+			return fd;
+		close(fd);
+	}
+
+	/* Fallback to IPv4 */
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+
+	set_reuseaddr(fd);
+
+	memset(&addr4, 0, sizeof(addr4));
+	addr4.sin_family = AF_INET;
+	addr4.sin_port = htons(port);
+
+	if (bind_addr && bind_addr[0])
+		inet_pton(AF_INET, bind_addr, &addr4.sin_addr);
+	else
+		addr4.sin_addr.s_addr = INADDR_ANY;
+
+	if (bind(fd, (struct sockaddr *)&addr4, sizeof(addr4)) < 0 ||
+	    listen(fd, LISTEN_BACKLOG) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
-void ctrl_send(int fd, const char* msg) {
-    send(fd, msg, strlen(msg), 0);
+static int connect_to_backend(const char *host, uint16_t port, int timeout_sec)
+{
+	struct addrinfo hints, *res, *rp;
+	char port_str[8];
+	int fd = -1;
+
+	if (!host || !host[0])
+		return -1;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	snprintf(port_str, sizeof(port_str), "%u", port);
+	if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res)
+		return -1;
+
+	for (rp = res; rp; rp = rp->ai_next) {
+		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+		if (fd < 0)
+			continue;
+
+		set_nonblocking(fd);
+
+		int ret = connect(fd, rp->ai_addr, rp->ai_addrlen);
+
+		if (ret == 0)
+			break;
+
+		if (errno != EINPROGRESS) {
+			close(fd);
+			fd = -1;
+			continue;
+		}
+
+		/* Wait for connect with timeout */
+		fd_set wfds;
+		struct timeval tv = {timeout_sec, 0};
+
+		FD_ZERO(&wfds);
+		FD_SET(fd, &wfds);
+
+		ret = select(fd + 1, NULL, &wfds, NULL, &tv);
+		if (ret <= 0) {
+			close(fd);
+			fd = -1;
+			continue;
+		}
+
+		int err = 0;
+		socklen_t optlen = sizeof(err);
+
+		getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &optlen);
+		if (err != 0) {
+			close(fd);
+			fd = -1;
+			continue;
+		}
+		break;
+	}
+
+	freeaddrinfo(res);
+	return fd;
 }
 
-void handle_ctrl(int fd) {
-    char buf[SPF_BUFFER_SIZE];
-    bool authed = g_state.config.admin.token[0] == '\0';
-    
-    ctrl_send(fd, "SPF v" SPF_VERSION " Control\n");
-    if (!authed) ctrl_send(fd, "AUTH required\n");
-    ctrl_send(fd, "> ");
-    
-    while (!g_shutdown) {
-        ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) break;
-        buf[n] = '\0';
-        
-        char* nl = strchr(buf, '\n'); if (nl) *nl = '\0';
-        char* cr = strchr(buf, '\r'); if (cr) *cr = '\0';
-        if (strlen(buf) == 0) { ctrl_send(fd, "> "); continue; }
-        
-        char resp[SPF_RES_MAX_LEN] = {0};
-        
-        if (strncmp(buf, "QUIT", 4) == 0) {
-            break;
-        }
-        else if (strncmp(buf, "AUTH ", 5) == 0) {
-            if (spf_verify_token(&g_state, buf + 5)) {
-                authed = true;
-                snprintf(resp, sizeof(resp), "OK authenticated\n");
-            } else {
-                spf_event_push(&g_state, SPF_EVENT_AUTH_FAIL, "", 0, 0, "bad token");
-                snprintf(resp, sizeof(resp), "ERR bad token\n");
-            }
-        }
-        else if (!authed) {
-            snprintf(resp, sizeof(resp), "ERR auth required\n");
-        }
-        else if (strncmp(buf, "HELP", 4) == 0) {
-            snprintf(resp, sizeof(resp),
-                "Commands:\n"
-                "  AUTH <token>       - authenticate\n"
-                "  STATUS             - system stats\n"
-                "  RULES              - list rules\n"
-                "  BACKENDS <id>      - show backends\n"
-                "  ADD <port> <ip:port> [algo] [max_conns] [accept_rate] - add rule\n"
-                "  DEL <id>           - delete rule\n"
-                "  BLOCK <ip> [sec]   - block ip\n"
-                "  UNBLOCK <ip>       - unblock ip\n"
-                "  LOGS [n]           - recent events\n"
-                "  METRICS            - prometheus\n"
-                "  HOOKS              - show custom hooks\n"
-                "  RELOAD             - hot reload config\n"
-                "  QUIT               - close\n");
-        }
-        else if (strncmp(buf, "STATUS", 6) == 0) {
-            uint64_t up = spf_time_sec() - g_state.start_time;
-            snprintf(resp, sizeof(resp),
-                "--- SPF STATUS ---\n"
-                "Version: %s\n"
-                "Uptime: %luh %lum %lus\n"
-                "Active Conns: %u\n"
-                "Total Conns: %lu\n"
-                "Bytes In: %lu\n"
-                "Bytes Out: %lu\n"
-                "Rules: %u\n"
-                "Blocked IPs: %lu\n",
-                SPF_VERSION,
-                up/3600, (up%3600)/60, up%60,
-                g_state.active_conns,
-                g_state.total_conns,
-                g_state.total_bytes_in,
-                g_state.total_bytes_out,
-                g_state.rule_count,
-                g_state.blocked_count);
-        }
-        else if (strncmp(buf, "RULES", 5) == 0) {
-            char* p = resp;
-            p += snprintf(p, sizeof(resp), "--- RULES ---\n");
-            for (int i = 0; i < SPF_MAX_RULES && p - resp < SPF_RES_MAX_LEN - 100; i++) {
-                if (g_state.rules[i].active) {
-                    spf_rule_t* r = &g_state.rules[i];
-                    p += snprintf(p, SPF_RES_MAX_LEN - (p - resp),
-                        "ID:%u Port:%u Backends:%u LB:%d\n",
-                        r->id, r->listen_port, r->backend_count, r->lb_algo);
-                }
-            }
-        }
-        else if (strncmp(buf, "BACKENDS ", 9) == 0) {
-            uint32_t id;
-            if (sscanf(buf + 9, "%u", &id) == 1) {
-                spf_rule_t* r = spf_get_rule(&g_state, id);
-                if (r) {
-                    char* p = resp;
-                    p += snprintf(p, sizeof(resp), "--- BACKENDS for %u ---\n", id);
-                    for (int i = 0; i < r->backend_count; i++) {
-                        spf_backend_t* b = &r->backends[i];
-                        p += snprintf(p, SPF_RES_MAX_LEN - (p - resp),
-                            "%s:%u w=%u state=%s conns=%u\n",
-                            b->host, b->port, b->weight,
-                            b->state == SPF_BACKEND_UP ? "UP" : b->state == SPF_BACKEND_DOWN ? "DOWN" : "DRAIN",
-                            b->active_conns);
-                    }
-                } else {
-                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
-                }
-            }
-        }
-        else if (strncmp(buf, "ADD ", 4) == 0) {
-                int port;
-                char backend[64];
-                char algo[16] = "rr";
-                int max_conns = 0;
-                int accept_rate = 0;
-                int parsed = sscanf(buf + 4, "%d %63s %15s %d %d", &port, backend, algo, &max_conns, &accept_rate);
-                
-                if (parsed >= 2 && port > 0 && port < 65536) {
-                    spf_rule_t rule;
-                    memset(&rule, 0, sizeof(rule));
-                uint8_t rnd[4];
-                spf_random_bytes(rnd, 4);
-                rule.id = (*(uint32_t*)rnd) % 90000 + 10000;
-                rule.listen_port = port;
-                rule.enabled = true;
-                rule.rate_bps = 100 * 1024 * 1024;
-                    rule.max_conns = max_conns > 0 ? (uint32_t)max_conns : 512;
-                    rule.accept_rate = accept_rate > 0 ? (uint32_t)accept_rate : (g_state.config.security.rate_global ? g_state.config.security.rate_global : 5000);
-                    if (rule.accept_rate) {
-                        spf_bucket_init(&rule.accept_bucket, rule.accept_rate, 2.0);
-                    }
-                
-                if (strcmp(algo, "lc") == 0) rule.lb_algo = SPF_LB_LEASTCONN;
-                else if (strcmp(algo, "ip") == 0) rule.lb_algo = SPF_LB_IPHASH;
-                else if (strcmp(algo, "w") == 0) rule.lb_algo = SPF_LB_WEIGHTED;
-                else rule.lb_algo = SPF_LB_ROUNDROBIN;
-                
-                char* tok = strtok(backend, ",");
-                while (tok && rule.backend_count < SPF_MAX_BACKENDS) {
-                    char* colon = strchr(tok, ':');
-                    if (colon) {
-                        *colon = '\0';
-                        int port = safe_parse_port(colon + 1);
-                        if (port > 0) {
-                            strncpy(rule.backends[rule.backend_count].host, tok, SPF_IP_MAX_LEN - 1);
-                            rule.backends[rule.backend_count].port = port;
-                            rule.backends[rule.backend_count].weight = 1;
-                            rule.backends[rule.backend_count].state = SPF_BACKEND_UP;
-                            rule.backend_count++;
-                        }
-                    }
-                    tok = strtok(NULL, ",");
-                }
-                
-                if (rule.backend_count > 0) {
-                    if (spf_add_rule(&g_state, &rule) == 0) {
-                        spf_rule_t* added = spf_get_rule(&g_state, rule.id);
-                        if (added) {
-                            pthread_create(&added->listen_thread, NULL, listener_thread, added);
-                            pthread_detach(added->listen_thread);
-                            snprintf(resp, sizeof(resp), "OK rule %u added\n", rule.id);
-                        } else {
-                            snprintf(resp, sizeof(resp), "ERR internal error\n");
-                        }
-                    } else {
-                        snprintf(resp, sizeof(resp), "ERR failed to add rule\n");
-                    }
-                } else {
-                    snprintf(resp, sizeof(resp), "ERR bad backend format\n");
-                }
-            } else {
-                    snprintf(resp, sizeof(resp), "ERR usage: ADD <port> <host:port,...> [rr|lc|ip|w] [max_conns] [accept_rate]\n");
-            }
-        }
-        else if (strncmp(buf, "DEL ", 4) == 0) {
-            uint32_t id;
-            if (sscanf(buf + 4, "%u", &id) == 1) {
-                if (spf_del_rule(&g_state, id) == 0) {
-                    snprintf(resp, sizeof(resp), "OK deleted\n");
-                } else {
-                    snprintf(resp, sizeof(resp), "ERR not found\n");
-                }
-            }
-        }
-        else if (strncmp(buf, "BLOCK ", 6) == 0) {
-            char ip[64] = {0};
-            uint64_t dur = 3600;
-            int parsed = sscanf(buf + 6, "%63s %lu", ip, &dur);
-            if (parsed >= 1 && ip[0] != '\0') {
-                spf_block_ip(&g_state, ip, dur);
-                snprintf(resp, sizeof(resp), "OK blocked %s for %lu sec\n", ip, dur);
-            } else {
-                snprintf(resp, sizeof(resp), "ERR usage: BLOCK <ip> [seconds]\n");
-            }
-        }
-        else if (strncmp(buf, "UNBLOCK ", 8) == 0) {
-            char ip[64];
-            if (sscanf(buf + 8, "%63s", ip) == 1) {
-                spf_unblock_ip(&g_state, ip);
-                snprintf(resp, sizeof(resp), "OK unblocked %s\n", ip);
-            }
-        }
-        else if (strncmp(buf, "LOGS", 4) == 0) {
-            uint32_t n = 10;
-            sscanf(buf + 4, "%u", &n);
-            if (n > 50) n = 50;
-            
-            spf_event_t events[50];
-            uint32_t actual;
-            spf_event_get_recent(&g_state, events, n, &actual);
-            
-            char* p = resp;
-            p += snprintf(p, sizeof(resp), "--- LAST %u EVENTS ---\n", actual);
-            for (uint32_t i = 0; i < actual && p - resp < SPF_RES_MAX_LEN - 150; i++) {
-                p += snprintf(p, SPF_RES_MAX_LEN - (p - resp),
-                    "%lu type=%d %s:%u %s\n",
-                    events[i].timestamp, events[i].type,
-                    events[i].src_ip, events[i].src_port,
-                    events[i].details);
-            }
-        }
-        else if (strncmp(buf, "METRICS", 7) == 0) {
-            snprintf(resp, sizeof(resp),
-                "# HELP spf_connections_active Current active connections\n"
-                "spf_connections_active %u\n"
-                "# HELP spf_connections_total Total connections since start\n"
-                "spf_connections_total %lu\n"
-                "# HELP spf_bytes_in_total Total bytes received\n"
-                "spf_bytes_in_total %lu\n"
-                "# HELP spf_bytes_out_total Total bytes sent\n"
-                "spf_bytes_out_total %lu\n"
-                "# HELP spf_blocked_total Total blocked IPs\n"
-                "spf_blocked_total %lu\n"
-                "# HELP spf_rules_active Active forwarding rules\n"
-                "spf_rules_active %u\n",
-                g_state.active_conns,
-                g_state.total_conns,
-                g_state.total_bytes_in,
-                g_state.total_bytes_out,
-                g_state.blocked_count,
-                g_state.rule_count);
-        }
-        else if (strncmp(buf, "HOOKS", 5) == 0) {
-            spf_hooks_get_info(resp, sizeof(resp));
-        }
-        else if (strncmp(buf, "RELOAD", 6) == 0) {
-            if (spf_reload_config(&g_state) == 0) {
-                snprintf(resp, sizeof(resp), "OK config reloaded\n");
-            } else {
-                snprintf(resp, sizeof(resp), "ERR reload failed\n");
-            }
-        }
-        else {
-            snprintf(resp, sizeof(resp), "ERR unknown cmd\n");
-        }
-        
-        ctrl_send(fd, resp);
-        ctrl_send(fd, "> ");
-    }
-    
-    close(fd);
+/* ============================================================================
+ * Session Management
+ * ============================================================================ */
+
+struct session {
+	int			client_fd;
+	int			backend_fd;
+	struct sockaddr_storage	client_addr;
+	struct tunl_rule	*rule;
+	int			backend_idx;
+	uint64_t		bytes_in;
+	uint64_t		bytes_out;
+	bool			active;
+};
+
+static void session_run(struct session *s)
+{
+	int epfd;
+	struct epoll_event ev, events[2];
+	uint8_t buf[TUNL_BUFFER_SIZE];
+
+	epfd = epoll_create1(EPOLL_CLOEXEC);
+	if (epfd < 0)
+		return;
+
+	set_nonblocking(s->client_fd);
+	set_nonblocking(s->backend_fd);
+	set_nodelay(s->client_fd);
+	set_nodelay(s->backend_fd);
+
+	ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
+	ev.data.fd = s->client_fd;
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, s->client_fd, &ev) < 0) {
+		close(epfd);
+		return;
+	}
+
+	ev.data.fd = s->backend_fd;
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, s->backend_fd, &ev) < 0) {
+		close(epfd);
+		return;
+	}
+
+	while (!g_shutdown && s->active) {
+		int nfds = epoll_wait(epfd, events, 2, RECV_TIMEOUT * 1000);
+
+		if (nfds < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (nfds == 0)
+			break;
+
+		for (int i = 0; i < nfds; i++) {
+			if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+				s->active = false;
+				break;
+			}
+
+			if (events[i].data.fd == s->client_fd) {
+				ssize_t n = recv(s->client_fd, buf, sizeof(buf), 0);
+
+				if (n <= 0) {
+					s->active = false;
+					break;
+				}
+				if (send(s->backend_fd, buf, (size_t)n,
+					 MSG_NOSIGNAL) != n) {
+					s->active = false;
+					break;
+				}
+				s->bytes_in += (uint64_t)n;
+			} else if (events[i].data.fd == s->backend_fd) {
+				ssize_t n = recv(s->backend_fd, buf, sizeof(buf), 0);
+
+				if (n <= 0) {
+					s->active = false;
+					break;
+				}
+				if (send(s->client_fd, buf, (size_t)n,
+					 MSG_NOSIGNAL) != n) {
+					s->active = false;
+					break;
+				}
+				s->bytes_out += (uint64_t)n;
+			}
+		}
+	}
+
+	close(epfd);
 }
 
-void* ctrl_thread(void* arg) {
-    (void)arg;
-    
-    g_ctrl_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(g_ctrl_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    inet_pton(AF_INET, g_state.config.admin.bind_addr, &addr.sin_addr);
-    addr.sin_port = htons(g_state.config.admin.port);
-    
-    if (bind(g_ctrl_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        spf_log(SPF_LOG_ERROR, "ctrl bind failed: %s", strerror(errno));
-        return NULL;
-    }
-    
-    listen(g_ctrl_fd, 5);
-    spf_log(SPF_LOG_INFO, "ctrl listening on %s:%u", g_state.config.admin.bind_addr, g_state.config.admin.port);
-    
-    while (!g_shutdown && g_state.running) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(g_ctrl_fd, &fds);
-        struct timeval tv = {1, 0};
-        
-        if (select(g_ctrl_fd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
-        
-        int cli = accept(g_ctrl_fd, NULL, NULL);
-        if (cli >= 0) {
-            spf_log(SPF_LOG_INFO, "admin connected");
-            handle_ctrl(cli);
-            spf_log(SPF_LOG_INFO, "admin disconnected");
-        }
-    }
-    
-    close(g_ctrl_fd);
-    return NULL;
+static void *session_thread(void *arg)
+{
+	struct session *s = (struct session *)arg;
+
+	if (!s)
+		return NULL;
+
+	tunl_backend_conn_start(s->rule, s->backend_idx);
+	s->active = true;
+
+	pthread_mutex_lock(&g_state.lock);
+	g_state.session_count++;
+	pthread_mutex_unlock(&g_state.lock);
+
+	session_run(s);
+
+	close(s->client_fd);
+	close(s->backend_fd);
+	tunl_backend_conn_end(s->rule, s->backend_idx);
+
+	pthread_mutex_lock(&g_state.lock);
+	g_state.session_count--;
+	g_state.total_bytes_in += s->bytes_in;
+	g_state.total_bytes_out += s->bytes_out;
+	g_state.bytes_in += s->bytes_in;
+	g_state.bytes_out += s->bytes_out;
+	pthread_mutex_unlock(&g_state.lock);
+
+	free(s);
+	return NULL;
 }
 
-void daemonize(void) {
-    pid_t pid = fork();
-    if (pid < 0) exit(1);
-    if (pid > 0) exit(0);
-    if (setsid() < 0) exit(1);
-    pid = fork();
-    if (pid < 0) exit(1);
-    if (pid > 0) exit(0);
-    umask(0);
-    if (chdir("/") != 0) exit(1);
-    close(STDIN_FILENO);
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
+/* ============================================================================
+ * Listener
+ * ============================================================================ */
+
+static void *listener_thread(void *arg)
+{
+	struct tunl_rule *rule = (struct tunl_rule *)arg;
+	char ip[INET6_ADDRSTRLEN];
+	int lfd;
+
+	lfd = create_listen_socket(rule->listen_port, NULL);
+	if (lfd < 0) {
+		tunl_log(TUNL_LOG_ERROR, "bind port %u failed", rule->listen_port);
+		return NULL;
+	}
+
+	tunl_log(TUNL_LOG_INFO, "listening on [::]:%u", rule->listen_port);
+
+	while (!g_shutdown && g_state.running && rule->enabled) {
+		struct sockaddr_storage addr;
+		socklen_t addrlen = sizeof(addr);
+		int cfd = accept(lfd, (struct sockaddr *)&addr, &addrlen);
+
+		if (cfd < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+
+		get_ip_string(&addr, ip, sizeof(ip));
+
+		/* Rate limit check */
+		if (!tunl_rate_check(&g_state, ip)) {
+			close(cfd);
+			continue;
+		}
+
+		/* Connection limit check */
+		pthread_mutex_lock(&rule->lock);
+		if (rule->max_conns && rule->active_conns >= rule->max_conns) {
+			pthread_mutex_unlock(&rule->lock);
+			close(cfd);
+			continue;
+		}
+		pthread_mutex_unlock(&rule->lock);
+
+		/* Select backend */
+		int backend_idx = tunl_select_backend(rule, ip);
+
+		if (backend_idx < 0) {
+			close(cfd);
+			continue;
+		}
+
+		/* Connect to backend */
+		int bfd = connect_to_backend(rule->backends[backend_idx].host,
+					     rule->backends[backend_idx].port,
+					     CONN_TIMEOUT);
+		if (bfd < 0) {
+			close(cfd);
+			continue;
+		}
+
+		/* Create session */
+		struct session *sess = (struct session *)calloc(1, sizeof(*sess));
+
+		if (!sess) {
+			close(cfd);
+			close(bfd);
+			continue;
+		}
+
+		sess->client_fd = cfd;
+		sess->backend_fd = bfd;
+		memcpy(&sess->client_addr, &addr, sizeof(addr));
+		sess->rule = rule;
+		sess->backend_idx = backend_idx;
+
+		pthread_t tid;
+
+		if (pthread_create(&tid, NULL, session_thread, sess) != 0) {
+			close(cfd);
+			close(bfd);
+			free(sess);
+			continue;
+		}
+		pthread_detach(tid);
+
+		pthread_mutex_lock(&g_state.lock);
+		g_state.total_conns++;
+		pthread_mutex_unlock(&g_state.lock);
+	}
+
+	close(lfd);
+	tunl_log(TUNL_LOG_INFO, "listener stopped for port %u", rule->listen_port);
+	return NULL;
 }
 
-// Forward declarations for host mode (replaces tunnel mode)
-static int run_host_mode(int argc, char** argv);
+/* ============================================================================
+ * Control Interface
+ * ============================================================================ */
 
-int main(int argc, char** argv) {
-    // Check for subcommands
-    if (argc >= 2) {
-        if (strcmp(argv[1], "host") == 0 || strcmp(argv[1], "serve") == 0) {
-            return run_host_mode(argc - 1, argv + 1);
-        }
-    }
-    
-    const char* config_path = "spf.conf";
-    char* bind_addr = NULL;
-    char* token = NULL;
-    char* cert = NULL;
-    char* key = NULL;
-    int port = 0; // 0 means not set via CLI
-    bool daemon_mode = false;
-    char* forward_spec = NULL;  // One-liner mode: "8080:backend:80"
-    char* hooks_dir = NULL;
-    char* access_log_path = NULL;
-    
-    static struct option opts[] = {
-        {"config", required_argument, 0, 'C'},
-        {"admin-bind", required_argument, 0, 'b'},
-        {"admin-port", required_argument, 0, 'p'},
-        {"token", required_argument, 0, 't'},
-        {"cert", required_argument, 0, 'c'},
-        {"key", required_argument, 0, 'k'},
-        {"daemon", no_argument, 0, 'd'},
-        {"forward", required_argument, 0, 'f'},  // One-liner mode
-        {"hooks-dir", required_argument, 0, 'H'},
-        {"access-log", required_argument, 0, 'A'},
-        {"help", no_argument, 0, 'h'},
-        {0, 0, 0, 0}
-    };
-    
-    int c;
-    while ((c = getopt_long(argc, argv, "C:b:p:t:c:k:df:H:A:h", opts, NULL)) != -1) {
-        switch (c) {
-            case 'C': config_path = optarg; break;
-            case 'b': bind_addr = optarg; break;
-            case 'p': port = atoi(optarg); break;
-            case 't': token = optarg; break;
-            case 'c': cert = optarg; break;
-            case 'k': key = optarg; break;
-            case 'd': daemon_mode = true; break;
-            case 'f': forward_spec = optarg; break;
-            case 'H': hooks_dir = optarg; break;
-            case 'A': access_log_path = optarg; break;
-            case 'h':
-                printf("SPF v%s - Secure Port Forwarder\n\n", SPF_VERSION);
-                printf("Usage: spf [options] | spf host <port> [options]\n\n");
-                printf("Options:\n");
-                printf("  -f, --forward <listen:host:port>  Quick forward\n");
-                printf("  -C, --config <path>               Config file\n");
-                printf("  -c, --cert / -k, --key            TLS cert/key\n");
-                printf("  -d, --daemon                      Background mode\n");
-                printf("  -H, --hooks-dir <dir>             Hooks directory\n");
-                printf("  -A, --access-log <path>           Access log\n");
-                printf("  -h, --help                        Show help\n\n");
-                printf("Commands: host <port>, serve <port>\n");
-                printf("Example: spf -f 8080:backend:80\n");
-                return 0;
-        }
-    }
-    
-    if (daemon_mode) daemonize();
-    
-    spf_init(&g_state);
-    
-    // Initialize hook system
-    spf_hooks_init();
-    if (hooks_dir) {
-        spf_hooks_set_dir(hooks_dir);
-    }
-    spf_hooks_autodiscover();
-    
-    // Initialize access logging
-    if (access_log_path) {
-        spf_access_log_init(access_log_path);
-    }
-    
-    // Load config first
-    if (spf_load_config(&g_state, config_path) < 0) {
-        // If default config fails, just warn (unless specific config was requested)
-        if (strcmp(config_path, "spf.conf") != 0) {
-            fprintf(stderr, "Error: cannot load config file %s\n", config_path);
-            return 1;
-        } else {
-             // For default, maybe it doesn't exist yet, which is fine
-        }
-    }
-
-    if (bind_addr) strncpy(g_state.config.admin.bind_addr, bind_addr, SPF_IP_MAX_LEN - 1);
-    if (token) strncpy(g_state.config.admin.token, token, SPF_TOKEN_MAX - 1);
-    if (cert) strncpy(g_state.config.admin.cert_path, cert, SPF_PATH_MAX - 1);
-    if (key) strncpy(g_state.config.admin.key_path, key, SPF_PATH_MAX - 1);
-    
-    // Override port if set via CLI
-    if (port > 0) {
-        g_state.config.admin.port = port;
-    } else if (g_state.config.admin.port == 0) {
-        g_state.config.admin.port = SPF_CTRL_PORT_DEFAULT;
-    }
-    
-    if (cert && key) {
-        if (tls_init(cert, key) == 0) {
-            g_state.config.admin.tls_enabled = true;
-            spf_log(SPF_LOG_INFO, "tls enabled");
-        }
-    }
-    
-    // One-liner forward mode (socat pain point: complex syntax)
-    if (forward_spec) {
-        int listen_port;
-        char backend_host[128];
-        int backend_port;
-        
-        if (sscanf(forward_spec, "%d:%127[^:]:%d", &listen_port, backend_host, &backend_port) == 3) {
-            spf_rule_t rule;
-            memset(&rule, 0, sizeof(rule));
-            rule.id = 1;
-            rule.listen_port = listen_port;
-            rule.enabled = true;
-            rule.rate_bps = 100 * 1024 * 1024;
-            rule.max_conns = 4096;
-            rule.accept_rate = 10000;  // High rate for one-liner mode
-            spf_bucket_init(&rule.accept_bucket, rule.accept_rate, 2.0);
-            rule.lb_algo = SPF_LB_ROUNDROBIN;
-            rule.tls_terminate = (cert && key);
-            
-            // Resolve hostname to IP if needed
-            char resolved_ip[SPF_IP_MAX_LEN];
-            if (spf_resolve_hostname(backend_host, resolved_ip, sizeof(resolved_ip)) == 0) {
-                strncpy(rule.backends[0].host, resolved_ip, SPF_IP_MAX_LEN - 1);
-            } else {
-                strncpy(rule.backends[0].host, backend_host, SPF_IP_MAX_LEN - 1);
-            }
-            rule.backends[0].port = backend_port;
-            rule.backends[0].weight = 1;
-            rule.backends[0].state = SPF_BACKEND_UP;
-            rule.backend_count = 1;
-            
-            if (spf_add_rule(&g_state, &rule) == 0) {
-                spf_rule_t* added = spf_get_rule(&g_state, rule.id);
-                if (added) {
-                    pthread_create(&added->listen_thread, NULL, listener_thread, added);
-                    pthread_detach(added->listen_thread);
-                    spf_log(SPF_LOG_INFO, "one-liner: forwarding :%d -> %s:%d", 
-                           listen_port, rule.backends[0].host, backend_port);
-                }
-            } else {
-                spf_log(SPF_LOG_ERROR, "failed to add forward rule");
-                return 1;
-            }
-        } else {
-            fprintf(stderr, "Invalid forward spec. Use: listen_port:backend_host:backend_port\n");
-            return 1;
-        }
-    }
-
-    bool bind_is_loopback = strcmp(g_state.config.admin.bind_addr, "127.0.0.1") == 0 ||
-                            strcmp(g_state.config.admin.bind_addr, "::1") == 0;
-    if (!bind_is_loopback && g_state.config.admin.token[0] == '\0') {
-        spf_log(SPF_LOG_ERROR, "refusing to start: admin on %s:%u without auth token", 
-                g_state.config.admin.bind_addr, g_state.config.admin.port);
-        fprintf(stderr, "Set --token or configure admin.token when binding non-loopback.\n");
-        return 1;
-    }
-    
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-    signal(SIGHUP, sig_handler);  // Hot reload config
-    signal(SIGPIPE, SIG_IGN);
-    
-    if (!daemon_mode) {
-        printf("=== SPF v%s ===\n", SPF_VERSION);
-        printf("Control: nc %s %d\n", g_state.config.admin.bind_addr, g_state.config.admin.port);
-        if (token) printf("Token required for auth\n");
-    }
-    
-    pthread_t ct;
-    pthread_create(&ct, NULL, ctrl_thread, NULL);
-    
-    while (!g_shutdown && g_state.running) {
-        sleep(1);
-        
-        // SIGHUP hot reload (rinetd pain point: requires restart)
-        if (g_reload) {
-            g_reload = 0;
-            spf_log(SPF_LOG_INFO, "SIGHUP received, reloading config...");
-            spf_reload_config(&g_state);
-            spf_hooks_autodiscover();  // Re-scan hooks
-        }
-    }
-    
-    spf_log(SPF_LOG_INFO, "shutting down...");
-    g_state.running = false;
-    
-    if (g_ctrl_fd >= 0) close(g_ctrl_fd);
-    
-    pthread_join(ct, NULL);
-    tls_cleanup();
-    spf_access_log_close();
-    spf_hooks_cleanup();
-    spf_shutdown(&g_state);
-    
-    return 0;
+static void ctrl_send(int fd, const char *msg)
+{
+	if (msg)
+		send(fd, msg, strlen(msg), MSG_NOSIGNAL);
 }
 
-// ============================================================================
-// HOST MODE - Self-host from home with auto UPnP + DDNS (NO VPS!)
-// ============================================================================
-static int run_host_mode(int argc, char** argv) {
-    uint16_t local_port = 0;
-    uint16_t external_port = 0;
-    char* domain = NULL;
-    char* ddns_provider = NULL;
-    char* ddns_token = NULL;
-    char* ddns_user = NULL;
-    char* ddns_pass = NULL;
-    char* cert = NULL;
-    char* key = NULL;
-    bool no_upnp = false;
-    bool no_ddns = false;
-    
-    // Parse arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--domain") == 0 || strcmp(argv[i], "-D") == 0) {
-            if (i + 1 < argc) domain = argv[++i];
-        } else if (strcmp(argv[i], "--ddns") == 0) {
-            if (i + 1 < argc) ddns_provider = argv[++i];
-        } else if (strcmp(argv[i], "--token") == 0 || strcmp(argv[i], "-t") == 0) {
-            if (i + 1 < argc) ddns_token = argv[++i];
-        } else if (strcmp(argv[i], "--user") == 0 || strcmp(argv[i], "-u") == 0) {
-            if (i + 1 < argc) ddns_user = argv[++i];
-        } else if (strcmp(argv[i], "--pass") == 0) {
-            if (i + 1 < argc) ddns_pass = argv[++i];
-        } else if (strcmp(argv[i], "--external-port") == 0 || strcmp(argv[i], "-e") == 0) {
-            if (i + 1 < argc) external_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--cert") == 0 || strcmp(argv[i], "-c") == 0) {
-            if (i + 1 < argc) cert = argv[++i];
-        } else if (strcmp(argv[i], "--key") == 0 || strcmp(argv[i], "-k") == 0) {
-            if (i + 1 < argc) key = argv[++i];
-        } else if (strcmp(argv[i], "--no-upnp") == 0) {
-            no_upnp = true;
-        } else if (strcmp(argv[i], "--no-ddns") == 0) {
-            no_ddns = true;
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("SPF Host - Self-host with auto UPnP + DDNS\n\n");
-            printf("Usage: spf host <port> [options]\n\n");
-            printf("Options:\n");
-            printf("  -D, --domain <name>     Domain name\n");
-            printf("  --ddns <provider>       duckdns|noip|dynu|freedns\n");
-            printf("  -t, --token <token>     DDNS token\n");
-            printf("  -u, --user / --pass     DDNS credentials\n");
-            printf("  -e, --external-port     External port\n");
-            printf("  -c, --cert / -k, --key  TLS cert/key\n");
-            printf("  --no-upnp / --no-ddns   Disable features\n");
-            return 0;
-        } else if (argv[i][0] != '-' && local_port == 0 && isdigit(argv[i][0])) {
-            local_port = atoi(argv[i]);
-        }
-    }
-    
-    if (local_port == 0) {
-        printf("Usage: spf host <port>\nExample: spf host 3000\n");
-        return 1;
-    }
-    
-    if (external_port == 0) {
-        external_port = local_port;
-    }
-    
-    int test_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (test_sock >= 0) {
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(local_port);
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (connect(test_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0)
-            printf("Warning: port %u not listening\n", local_port);
-        close(test_sock);
-    }
-    
-    printf("\nSPF Host v%s\n", SPF_VERSION);
-    printf("Local: %u, External: %u\n", local_port, external_port);
-    if (domain) printf("Domain: %s\n", domain);
-    if (cert && key) printf("TLS: enabled\n");
-    
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-    signal(SIGPIPE, SIG_IGN);
-    
-    // Initialize security module
-    spf_security_init();
-    printf("Security: enabled\n");
-    
-    // Initialize UPnP and open port on router
-    char external_ip[SPF_IP_MAX_LEN] = {0};
-    char local_ip[SPF_IP_MAX_LEN] = {0};
-    
-    if (!no_upnp) {
-        if (spf_upnp_init() == 0) {
-            g_upnp_enabled = true;
-            spf_upnp_get_external_ip(external_ip, sizeof(external_ip));
-            spf_upnp_get_local_ip(local_ip, sizeof(local_ip));
-            printf("UPnP: %s %s->%s\n", spf_upnp_type_str(), local_ip, external_ip);
-            char desc[32];
-            snprintf(desc, sizeof(desc), "SPF %u", external_port);
-            if (spf_upnp_add_port(external_port, local_port, "TCP", desc) == 0)
-                printf("Port %u opened\n", external_port);
-        }
-    }
-    
-    if (!no_ddns && ddns_provider && ddns_token) {
-        spf_ddns_provider_t provider = spf_ddns_parse_provider(ddns_provider);
-        if (provider != SPF_DDNS_NONE) {
-            if (spf_ddns_init(provider, domain, ddns_token) == 0) {
-                g_ddns_enabled = true;
-                if (ddns_user && ddns_pass)
-                    spf_ddns_set_credentials(ddns_user, ddns_pass);
-                printf("DDNS: %s\n", ddns_provider);
-            }
-        }
-    }
-    
-    if (external_ip[0] && domain) {
-        printf("Access: %s://%s\n", (cert && key) ? "https" : "http", domain);
-    } else if (external_ip[0]) {
-        printf("Access: %s://%s:%u\n", (cert && key) ? "https" : "http", external_ip, external_port);
-    } else {
-        printf("Forward port %u to this machine\n", external_port);
-    }
-    printf("Press Ctrl+C to stop\n\n");
-    
-    // Initialize TLS if certs provided
-    if (cert && key) {
-        if (tls_init(cert, key) == 0) {
-            spf_log(SPF_LOG_INFO, "host: TLS enabled");
-        }
-    }
-    
-    // Initialize main state and create forwarding rule
-    spf_init(&g_state);
-    spf_hooks_init();
-    spf_hooks_autodiscover();
-    
-    // Create rule to forward external:port -> localhost:local_port
-    spf_rule_t rule;
-    memset(&rule, 0, sizeof(rule));
-    rule.id = 1;
-    rule.listen_port = local_port;  // We listen on local port
-    rule.enabled = true;
-    rule.active = true;
-    rule.tls_terminate = (cert && key);
-    rule.lb_algo = SPF_LB_ROUNDROBIN;
-    rule.max_conns = 1000;
-    rule.accept_rate = 200;
-    spf_bucket_init(&rule.accept_bucket, rule.accept_rate, 2.0);
-    
-    // Backend is localhost (the user's app)
-    strncpy(rule.backends[0].host, "127.0.0.1", SPF_IP_MAX_LEN - 1);
-    rule.backends[0].port = local_port;
-    rule.backends[0].weight = 1;
-    rule.backends[0].state = SPF_BACKEND_UP;
-    rule.backend_count = 1;
-    
-    if (spf_add_rule(&g_state, &rule) == 0) {
-        spf_rule_t* added = spf_get_rule(&g_state, rule.id);
-        if (added) {
-            pthread_create(&added->listen_thread, NULL, listener_thread, added);
-            pthread_detach(added->listen_thread);
-        }
-    }
-    
-    // Main loop
-    while (!g_shutdown && g_state.running) {
-        sleep(1);
-    }
-    
-    // Cleanup
-    printf("\n");
-    spf_log(SPF_LOG_INFO, "host: shutting down...");
-    
-    if (g_upnp_enabled) {
-        spf_log(SPF_LOG_INFO, "host: removing port mapping...");
-        spf_upnp_remove_port(external_port, "TCP");
-        spf_upnp_cleanup();
-    }
-    
-    if (g_ddns_enabled) {
-        spf_ddns_cleanup();
-    }
-    
-    spf_security_cleanup();
-    spf_hooks_cleanup();
-    tls_cleanup();
-    spf_shutdown(&g_state);
-    
-    printf("  ✅ Cleanup complete. Port mapping removed.\n\n");
-    
-    return 0;
+static void handle_ctrl(int fd)
+{
+	char buf[512], resp[2048];
+	bool authed = (g_state.token[0] == '\0');
+
+	ctrl_send(fd, "tunl v" TUNL_VERSION "\n");
+	if (!authed)
+		ctrl_send(fd, "AUTH required\n");
+	ctrl_send(fd, "> ");
+
+	while (!g_shutdown) {
+		ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+
+		if (n <= 0)
+			break;
+		buf[n] = '\0';
+
+		while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r'))
+			buf[--n] = '\0';
+
+		if (n == 0) {
+			ctrl_send(fd, "> ");
+			continue;
+		}
+
+		resp[0] = '\0';
+
+		if (strncmp(buf, "QUIT", 4) == 0) {
+			break;
+		} else if (strncmp(buf, "AUTH ", 5) == 0) {
+			if (tunl_verify_token(&g_state, buf + 5)) {
+				authed = true;
+				snprintf(resp, sizeof(resp), "OK\n");
+			} else {
+				snprintf(resp, sizeof(resp), "ERR bad token\n");
+			}
+		} else if (!authed) {
+			snprintf(resp, sizeof(resp), "ERR auth required\n");
+		} else if (strcmp(buf, "STATUS") == 0) {
+			uint64_t up = tunl_time_sec() - g_state.start_time;
+
+			snprintf(resp, sizeof(resp),
+				 "uptime: %luh%lum\n"
+				 "conns: %lu total\n"
+				 "bytes: %lu in, %lu out\n"
+				 "rules: %u\n",
+				 (unsigned long)(up / 3600),
+				 (unsigned long)((up % 3600) / 60),
+				 (unsigned long)g_state.total_conns,
+				 (unsigned long)g_state.total_bytes_in,
+				 (unsigned long)g_state.total_bytes_out,
+				 g_state.rule_count);
+		} else if (strcmp(buf, "RULES") == 0) {
+			char *p = resp;
+			size_t rem = sizeof(resp);
+
+			for (int i = 0; i < TUNL_MAX_RULES && rem > 100; i++) {
+				if (!g_state.rules[i].enabled)
+					continue;
+				int w = snprintf(p, rem, "rule %u: port %u, %u backends\n",
+						 g_state.rules[i].id,
+						 g_state.rules[i].listen_port,
+						 g_state.rules[i].backend_count);
+				if (w > 0 && (size_t)w < rem) {
+					p += w;
+					rem -= (size_t)w;
+				}
+			}
+		} else if (strcmp(buf, "SHUTDOWN") == 0) {
+			g_shutdown = 1;
+			snprintf(resp, sizeof(resp), "OK\n");
+		} else {
+			snprintf(resp, sizeof(resp),
+				 "commands: STATUS, RULES, QUIT, SHUTDOWN\n");
+		}
+
+		ctrl_send(fd, resp);
+		ctrl_send(fd, "> ");
+	}
+
+	close(fd);
 }
 
-#endif
+static void *ctrl_thread(void *arg)
+{
+	(void)arg;
+
+	g_ctrl_fd = create_listen_socket(g_state.ctrl_port, g_state.bind_addr);
+	if (g_ctrl_fd < 0) {
+		tunl_log(TUNL_LOG_ERROR, "ctrl bind failed");
+		return NULL;
+	}
+
+	tunl_log(TUNL_LOG_INFO, "ctrl on [%s]:%u",
+		 g_state.bind_addr[0] ? g_state.bind_addr : "::",
+		 g_state.ctrl_port);
+
+	while (!g_shutdown && g_state.running) {
+		int cfd = accept(g_ctrl_fd, NULL, NULL);
+
+		if (cfd >= 0)
+			handle_ctrl(cfd);
+	}
+
+	close(g_ctrl_fd);
+	return NULL;
+}
+
+/* ============================================================================
+ * Signal Handling & Main
+ * ============================================================================ */
+
+static void sig_handler(int sig)
+{
+	(void)sig;
+	g_shutdown = 1;
+}
+
+static void daemonize(void)
+{
+	pid_t pid = fork();
+
+	if (pid < 0)
+		exit(1);
+	if (pid > 0)
+		exit(0);
+	if (setsid() < 0)
+		exit(1);
+
+	pid = fork();
+	if (pid < 0)
+		exit(1);
+	if (pid > 0)
+		exit(0);
+
+	umask(0);
+	if (chdir("/") != 0)
+		exit(1);
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
+	close(STDERR_FILENO);
+}
+
+static void usage(void)
+{
+	printf("tunl v%s - IPv6-first self-hosting toolkit\n\n", TUNL_VERSION);
+	printf("Usage:\n");
+	printf("  tunl serve [options]        Start proxy server\n");
+	printf("  tunl dns [options]          DNS dynamic updates\n");
+	printf("  tunl cert [options]         TLS certificates (ACME)\n");
+	printf("  tunl check [options]        Reachability test\n");
+	printf("  tunl tui                    Terminal dashboard\n");
+	printf("  tunl -f <port:host:port>    Quick forward mode\n\n");
+	printf("Serve options:\n");
+	printf("  -C, --config <path>    Config file (default: tunl.conf)\n");
+	printf("  -d, --daemon           Run as daemon\n\n");
+	printf("DNS options:\n");
+	printf("  --provider <cf|rfc2136>   DNS provider\n");
+	printf("  --hostname <name>         Hostname to update\n");
+	printf("  --token <token>           API token\n");
+	printf("  --monitor                 Run as background monitor\n\n");
+	printf("Cert options:\n");
+	printf("  --domain <domain>         Domain for certificate\n");
+	printf("  --email <email>           Contact email\n");
+	printf("  --staging                 Use staging (test) server\n\n");
+	printf("Check options:\n");
+	printf("  --hostname <name>         Hostname to check\n");
+	printf("  --port <port>             Port to check\n\n");
+	printf("Examples:\n");
+	printf("  tunl -f 443:localhost:8080\n");
+	printf("  tunl serve -C /etc/tunl.conf -d\n");
+	printf("  tunl dns --provider cf --hostname my.example.com --token xxx\n");
+	printf("  tunl cert --domain my.example.com --email me@example.com\n");
+	printf("  tunl check --hostname my.example.com --port 443\n");
+	printf("  tunl tui\n");
+}
+
+/* ============================================================================
+ * Subcommand: serve
+ * ============================================================================ */
+
+static int cmd_serve(int argc, char **argv)
+{
+	static struct option opts[] = {
+		{"config", required_argument, 0, 'C'},
+		{"daemon", no_argument, 0, 'd'},
+		{"forward", required_argument, 0, 'f'},
+		{0, 0, 0, 0}
+	};
+
+	const char *config_path = "tunl.conf";
+	char *forward_spec = NULL;
+	bool daemon_mode = false;
+	int c;
+
+	optind = 1;  /* Reset getopt */
+	while ((c = getopt_long(argc, argv, "C:f:d", opts, NULL)) != -1) {
+		switch (c) {
+		case 'C':
+			config_path = optarg;
+			break;
+		case 'f':
+			forward_spec = optarg;
+			break;
+		case 'd':
+			daemon_mode = true;
+			break;
+		}
+	}
+
+	if (daemon_mode)
+		daemonize();
+
+	tunl_init(&g_state);
+	tunl_load_config(&g_state, config_path);
+
+	/* One-liner forward mode */
+	if (forward_spec) {
+		int lport, bport;
+		char bhost[128];
+
+		if (sscanf(forward_spec, "%d:%127[^:]:%d", &lport, bhost, &bport) == 3) {
+			struct tunl_rule rule;
+
+			memset(&rule, 0, sizeof(rule));
+			rule.id = 1;
+			rule.listen_port = (uint16_t)lport;
+			rule.enabled = true;
+			rule.lb_algo = TUNL_LB_ROUNDROBIN;
+			rule.max_conns = 512;
+
+			strncpy(rule.backends[0].host, bhost, TUNL_IP_MAX_LEN - 1);
+			rule.backends[0].host[TUNL_IP_MAX_LEN - 1] = '\0';
+			rule.backends[0].port = (uint16_t)bport;
+			rule.backends[0].state = TUNL_BACKEND_UP;
+			rule.backends[0].healthy = true;
+			rule.backend_count = 1;
+
+			if (tunl_add_rule(&g_state, &rule) == 0) {
+				struct tunl_rule *r = tunl_get_rule(&g_state, 1);
+
+				if (r) {
+					pthread_t tid;
+
+					pthread_create(&tid, NULL, listener_thread, r);
+					pthread_detach(tid);
+				}
+			}
+		} else {
+			fprintf(stderr, "Invalid: use port:host:port\n");
+			return 1;
+		}
+	}
+
+	/* Start listeners for config rules */
+	for (int i = 0; i < TUNL_MAX_RULES; i++) {
+		if (g_state.rules[i].enabled) {
+			pthread_t tid;
+
+			pthread_create(&tid, NULL, listener_thread, &g_state.rules[i]);
+			pthread_detach(tid);
+		}
+	}
+
+	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
+	signal(SIGPIPE, SIG_IGN);
+
+	pthread_t ctrl_tid;
+
+	pthread_create(&ctrl_tid, NULL, ctrl_thread, NULL);
+
+	if (!daemon_mode) {
+		printf("tunl v%s\n", TUNL_VERSION);
+		printf("ctrl: nc %s %d\n", 
+		       g_state.bind_addr[0] ? g_state.bind_addr : "localhost",
+		       g_state.ctrl_port);
+	}
+
+	while (!g_shutdown && g_state.running)
+		sleep(1);
+
+	tunl_log(TUNL_LOG_INFO, "shutting down");
+	g_state.running = false;
+
+	if (g_ctrl_fd >= 0)
+		close(g_ctrl_fd);
+
+	pthread_join(ctrl_tid, NULL);
+	tunl_shutdown(&g_state);
+
+	return 0;
+}
+
+/* ============================================================================
+ * Subcommand: dns
+ * ============================================================================ */
+
+static int cmd_dns(int argc, char **argv)
+{
+	static struct option opts[] = {
+		{"provider", required_argument, 0, 'p'},
+		{"hostname", required_argument, 0, 'H'},
+		{"token", required_argument, 0, 't'},
+		{"monitor", no_argument, 0, 'm'},
+		{"status", no_argument, 0, 's'},
+		{0, 0, 0, 0}
+	};
+
+	const char *provider = "cloudflare";
+	const char *hostname = NULL;
+	const char *token = NULL;
+	bool monitor = false;
+	bool status = false;
+	int c;
+
+	optind = 1;
+	while ((c = getopt_long(argc, argv, "p:H:t:ms", opts, NULL)) != -1) {
+		switch (c) {
+		case 'p':
+			provider = optarg;
+			break;
+		case 'H':
+			hostname = optarg;
+			break;
+		case 't':
+			token = optarg;
+			break;
+		case 'm':
+			monitor = true;
+			break;
+		case 's':
+			status = true;
+			break;
+		}
+	}
+
+	if (status) {
+		char buf[1024];
+		dns_status(buf, sizeof(buf));
+		printf("%s", buf);
+		return 0;
+	}
+
+	if (!hostname) {
+		fprintf(stderr, "Error: --hostname required\n");
+		return 1;
+	}
+
+	if (dns_init(provider, hostname, token) != 0) {
+		fprintf(stderr, "Error: DNS init failed\n");
+		return 1;
+	}
+
+	if (monitor) {
+		printf("Starting DNS monitor for %s (provider: %s)\n", hostname, provider);
+		signal(SIGINT, sig_handler);
+		signal(SIGTERM, sig_handler);
+		g_state.running = true;
+		dns_monitor_thread(NULL);
+	} else {
+		/* One-shot update */
+		char buf[1024];
+		printf("Updating DNS for %s...\n", hostname);
+		dns_status(buf, sizeof(buf));
+		printf("%s", buf);
+	}
+
+	return 0;
+}
+
+/* ============================================================================
+ * Subcommand: cert
+ * ============================================================================ */
+
+static int cmd_cert(int argc, char **argv)
+{
+	static struct option opts[] = {
+		{"domain", required_argument, 0, 'd'},
+		{"email", required_argument, 0, 'e'},
+		{"staging", no_argument, 0, 's'},
+		{"status", no_argument, 0, 'S'},
+		{0, 0, 0, 0}
+	};
+
+	const char *domain = NULL;
+	const char *email = NULL;
+	bool staging = false;
+	bool status = false;
+	int c;
+
+	optind = 1;
+	while ((c = getopt_long(argc, argv, "d:e:sS", opts, NULL)) != -1) {
+		switch (c) {
+		case 'd':
+			domain = optarg;
+			break;
+		case 'e':
+			email = optarg;
+			break;
+		case 's':
+			staging = true;
+			break;
+		case 'S':
+			status = true;
+			break;
+		}
+	}
+
+	if (status) {
+		char buf[1024];
+		acme_status(buf, sizeof(buf));
+		printf("%s", buf);
+		return 0;
+	}
+
+	if (!domain) {
+		fprintf(stderr, "Error: --domain required\n");
+		return 1;
+	}
+
+	if (acme_init(domain, email, staging ? 1 : 0) != 0) {
+		fprintf(stderr, "Error: ACME init failed\n");
+		return 1;
+	}
+
+	printf("Requesting certificate for %s...\n", domain);
+	printf("Mode: %s\n", staging ? "staging (test)" : "production");
+
+	if (acme_ensure_cert() == 0) {
+		printf("Certificate obtained!\n");
+		printf("  Cert: %s\n", acme_get_cert_path());
+		printf("  Key:  %s\n", acme_get_key_path());
+		return 0;
+	} else {
+		fprintf(stderr, "Certificate request failed\n");
+		return 1;
+	}
+}
+
+/* ============================================================================
+ * Subcommand: check
+ * ============================================================================ */
+
+static int cmd_check(int argc, char **argv)
+{
+	static struct option opts[] = {
+		{"hostname", required_argument, 0, 'H'},
+		{"port", required_argument, 0, 'p'},
+		{"quick", no_argument, 0, 'q'},
+		{0, 0, 0, 0}
+	};
+
+	const char *hostname = NULL;
+	int port = 443;
+	bool quick = false;
+	int c;
+
+	optind = 1;
+	while ((c = getopt_long(argc, argv, "H:p:q", opts, NULL)) != -1) {
+		switch (c) {
+		case 'H':
+			hostname = optarg;
+			break;
+		case 'p':
+			port = atoi(optarg);
+			break;
+		case 'q':
+			quick = true;
+			break;
+		}
+	}
+
+	if (quick) {
+		return check_quick(hostname, port);
+	} else {
+		return check_connectivity(hostname, port);
+	}
+}
+
+/* ============================================================================
+ * Subcommand: tui
+ * ============================================================================ */
+
+static int cmd_tui(int argc, char **argv)
+{
+	(void)argc;
+	(void)argv;
+
+	tunl_init(&g_state);
+	g_state.running = true;
+	
+	return tui_run();
+}
+
+/* ============================================================================
+ * Main
+ * ============================================================================ */
+
+int main(int argc, char **argv)
+{
+	if (argc < 2) {
+		usage();
+		return 1;
+	}
+
+	/* Quick forward mode: tunl -f port:host:port */
+	if (strcmp(argv[1], "-f") == 0 || strcmp(argv[1], "--forward") == 0) {
+		return cmd_serve(argc, argv);
+	}
+
+	/* Help */
+	if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0 ||
+	    strcmp(argv[1], "help") == 0) {
+		usage();
+		return 0;
+	}
+
+	/* Version */
+	if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0 ||
+	    strcmp(argv[1], "version") == 0) {
+		printf("tunl v%s\n", TUNL_VERSION);
+		return 0;
+	}
+
+	/* Subcommands */
+	if (strcmp(argv[1], "serve") == 0) {
+		return cmd_serve(argc - 1, argv + 1);
+	} else if (strcmp(argv[1], "dns") == 0) {
+		return cmd_dns(argc - 1, argv + 1);
+	} else if (strcmp(argv[1], "cert") == 0) {
+		return cmd_cert(argc - 1, argv + 1);
+	} else if (strcmp(argv[1], "check") == 0) {
+		return cmd_check(argc - 1, argv + 1);
+	} else if (strcmp(argv[1], "tui") == 0) {
+		return cmd_tui(argc - 1, argv + 1);
+	} else {
+		fprintf(stderr, "Unknown command: %s\n\n", argv[1]);
+		usage();
+		return 1;
+	}
+}
