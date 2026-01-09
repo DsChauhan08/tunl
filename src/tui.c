@@ -53,10 +53,73 @@ struct tui_state {
 	uint64_t bytes_out;
 	int active_sessions;
 	int total_sessions;
+	double cpu_pct;
+	uint64_t mem_total;
+	uint64_t mem_used;
 };
 
 static struct tui_state g_tui;
 static volatile sig_atomic_t tui_resize = 0;
+
+/* Minimal system metrics (btop-lite) */
+struct cpu_sample {
+	uint64_t user, nice, system, idle, iowait, irq, softirq, steal;
+};
+
+static int read_cpu_sample(struct cpu_sample *s)
+{
+	if (!s)
+		return -1;
+	FILE *f = fopen("/proc/stat", "r");
+	if (!f)
+		return -1;
+	int n = fscanf(f, "cpu %lu %lu %lu %lu %lu %lu %lu %lu",
+			&s->user, &s->nice, &s->system, &s->idle,
+			&s->iowait, &s->irq, &s->softirq, &s->steal);
+	fclose(f);
+	return (n >= 4) ? 0 : -1;
+}
+
+static double cpu_usage_pct(struct cpu_sample *prev, struct cpu_sample *cur)
+{
+	uint64_t p_idle = prev->idle + prev->iowait;
+	uint64_t c_idle = cur->idle + cur->iowait;
+	uint64_t p_non = prev->user + prev->nice + prev->system + prev->irq + prev->softirq + prev->steal;
+	uint64_t c_non = cur->user + cur->nice + cur->system + cur->irq + cur->softirq + cur->steal;
+	uint64_t p_total = p_idle + p_non;
+	uint64_t c_total = c_idle + c_non;
+	uint64_t d_total = c_total - p_total;
+	uint64_t d_idle = c_idle - p_idle;
+	if (d_total == 0)
+		return 0.0;
+	return ((double)(d_total - d_idle) / (double)d_total) * 100.0;
+}
+
+static int read_mem(uint64_t *total, uint64_t *used)
+{
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (!f)
+		return -1;
+	char key[32];
+	uint64_t val;
+	uint64_t mt = 0, ma = 0;
+	while (fscanf(f, "%31s %lu kB", key, &val) == 2) {
+		if (strcmp(key, "MemTotal:") == 0)
+			mt = val * 1024ULL;
+		else if (strcmp(key, "MemAvailable:") == 0)
+			ma = val * 1024ULL;
+		if (mt && ma)
+			break;
+	}
+	fclose(f);
+	if (mt == 0 || ma == 0)
+		return -1;
+	if (total)
+		*total = mt;
+	if (used)
+		*used = mt > ma ? mt - ma : 0;
+	return 0;
+}
 
 /*
  * Signal handler for terminal resize
@@ -97,6 +160,35 @@ static void tui_format_bytes(uint64_t bytes, char *buf, size_t len)
 		snprintf(buf, len, "%lu B", (unsigned long)bytes);
 }
 
+static void tui_format_pct(double pct, char *buf, size_t len)
+{
+	if (pct < 0)
+		pct = 0;
+	if (pct > 100)
+		pct = 100;
+	snprintf(buf, len, "%5.1f%%", pct);
+}
+
+static void tui_update_system(struct cpu_sample *prev)
+{
+	struct cpu_sample cur;
+	static int have_prev;
+
+	if (prev) {
+		if (!have_prev) {
+			if (read_cpu_sample(prev) == 0)
+				have_prev = 1;
+		} else if (read_cpu_sample(&cur) == 0) {
+			g_tui.cpu_pct = cpu_usage_pct(prev, &cur);
+			*prev = cur;
+		}
+	}
+	if (read_mem(&g_tui.mem_total, &g_tui.mem_used) != 0) {
+		g_tui.mem_total = 0;
+		g_tui.mem_used = 0;
+	}
+}
+
 /*
  * Format uptime
  */
@@ -124,11 +216,17 @@ static void tui_draw_ansi(void)
 {
 	char uptime[32];
 	char bytes_in[16], bytes_out[16];
+	char cpu[16], mem[32];
 	int row = 0;
 
 	tui_format_uptime(g_tui.start_time, uptime, sizeof(uptime));
 	tui_format_bytes(g_tui.bytes_in, bytes_in, sizeof(bytes_in));
 	tui_format_bytes(g_tui.bytes_out, bytes_out, sizeof(bytes_out));
+	tui_format_pct(g_tui.cpu_pct, cpu, sizeof(cpu));
+	if (g_tui.mem_total)
+		snprintf(mem, sizeof(mem), "%.1f/%.1f GB", (double)g_tui.mem_used/1e9, (double)g_tui.mem_total/1e9);
+	else
+		strncpy(mem, "n/a", sizeof(mem));
 
 	printf(ANSI_CLEAR);
 	printf(ANSI_BOLD ANSI_CYAN);
@@ -141,6 +239,9 @@ static void tui_draw_ansi(void)
 	/* Stats row */
 	printf("║ Uptime: %-12s │ Sessions: %-6d │ In: %-10s Out: %-10s║\n",
 	       uptime, g_tui.active_sessions, bytes_in, bytes_out);
+	row++;
+	printf("║ CPU: %-7s │ Mem: %-16s │ Active rules: %-3u                         ║\n",
+	       cpu, mem, g_state.rule_count);
 	row++;
 
 	printf("╠══════════════════════════════════════════════════════════════════════╣\n");
@@ -227,6 +328,7 @@ static int tui_handle_input_ansi(void)
 static void tui_run_ansi(void)
 {
 	struct termios old_term, new_term;
+	struct cpu_sample prev = {0};
 	
 	/* Set terminal to raw mode */
 	tcgetattr(STDIN_FILENO, &old_term);
@@ -250,6 +352,8 @@ static void tui_run_ansi(void)
 		g_tui.bytes_in = g_state.bytes_in;
 		g_tui.bytes_out = g_state.bytes_out;
 		pthread_mutex_unlock(&g_state.lock);
+
+		tui_update_system(&prev);
 
 		tui_draw_ansi();
 
@@ -298,10 +402,16 @@ static void tui_draw_ncurses(void)
 {
 	char uptime[32];
 	char bytes_in[16], bytes_out[16];
+	char cpu[16], mem[32];
 
 	tui_format_uptime(g_tui.start_time, uptime, sizeof(uptime));
 	tui_format_bytes(g_tui.bytes_in, bytes_in, sizeof(bytes_in));
 	tui_format_bytes(g_tui.bytes_out, bytes_out, sizeof(bytes_out));
+	tui_format_pct(g_tui.cpu_pct, cpu, sizeof(cpu));
+	if (g_tui.mem_total)
+		snprintf(mem, sizeof(mem), "%.1f/%.1f GB", (double)g_tui.mem_used/1e9, (double)g_tui.mem_total/1e9);
+	else
+		strncpy(mem, "n/a", sizeof(mem));
 
 	/* Header */
 	werase(win_header);
@@ -346,8 +456,8 @@ static void tui_draw_ncurses(void)
 	werase(win_status);
 	box(win_status, 0, 0);
 	mvwprintw(win_status, 1, 2, 
-		  "Up: %s | Sessions: %d | In: %s | Out: %s",
-		  uptime, g_tui.active_sessions, bytes_in, bytes_out);
+		  "Up: %s | CPU: %s | Mem: %s | Sessions: %d | In: %s | Out: %s",
+		  uptime, cpu, mem, g_tui.active_sessions, bytes_in, bytes_out);
 	mvwprintw(win_status, 1, COLS - 30, "q:quit r:reload h:help");
 	wrefresh(win_status);
 }
@@ -355,6 +465,7 @@ static void tui_draw_ncurses(void)
 static void tui_run_ncurses(void)
 {
 	int ch;
+	struct cpu_sample prev = {0};
 
 	tui_init_ncurses();
 
@@ -365,6 +476,8 @@ static void tui_run_ncurses(void)
 		g_tui.bytes_in = g_state.bytes_in;
 		g_tui.bytes_out = g_state.bytes_out;
 		pthread_mutex_unlock(&g_state.lock);
+
+		tui_update_system(&prev);
 
 		tui_draw_ncurses();
 
