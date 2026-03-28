@@ -1,0 +1,25 @@
+[admin]
+bind = 127.0.0.1
+port = 8081
+token = change-me
+tls = false
+mtls = false
+ca = /etc/ssl/certs/ca-certificates.crt
+allowlist = 127.0.0.1
+
+[security]
+enabled = true
+rate_per_ip = 120
+rate_global = 5000
+proxy_proto = false
+ddos = true
+
+[metrics]
+enabled = true
+port = 9100
+
+[rule.web]
+listen = 8080
+lb = rr
+backend = 127.0.0.1:9000:1
+rate = 104857600
