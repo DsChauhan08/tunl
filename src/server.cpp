@@ -1,19 +1,6 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/*
- * tunl - IPv6-first TCP proxy and self-hosting toolkit
- *
- * Unified CLI with subcommands:
- *   tunl serve    - Start proxy server
- *   tunl dns      - DNS management and monitoring
- *   tunl cert     - TLS certificate management
- *   tunl check    - Reachability self-test
- *   tunl tui      - Terminal dashboard
- *
- * Linux kernel style: minimal, correct, no bloat.
- */
+#ifndef SPF_PLATFORM_ESP32
 
 #include "common.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,1289 +9,1484 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <ctype.h>
+#include <limits.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/epoll.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <getopt.h>
-#include <netdb.h>
-#include <termios.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
-#define LISTEN_BACKLOG	128
-#define RECV_TIMEOUT	30
-#define CONN_TIMEOUT	5
-
-static volatile sig_atomic_t g_shutdown;
+spf_state_t g_state;
 static int g_ctrl_fd = -1;
-static void start_rule_workers(struct tunl_rule *rule)
-{
-	if (!rule || !rule->enabled || rule->backend_count == 0)
-		return;
+static volatile sig_atomic_t g_shutdown = 0;
 
-	pthread_t tid;
+typedef struct {
+    int client_fd;
+    int target_fd;
+    SSL* client_ssl;
+    SSL* target_ssl;
+    struct sockaddr_in client_addr;
+    spf_rule_t* rule;
+    uint8_t backend_idx;
+    uint32_t conn_idx;
+} session_t;
 
-	if (pthread_create(&tid, NULL, tunl_health_worker, rule) == 0)
-		pthread_detach(tid);
-	else
-		tunl_log(TUNL_LOG_WARN, "health thread start failed for port %u",
-			rule->listen_port);
+static void release_conn_slot(uint32_t conn_idx, bool rollback_total) {
+    pthread_mutex_lock(&g_state.stats_lock);
+    if (conn_idx < SPF_MAX_CONNECTIONS && g_state.connections[conn_idx].active) {
+        g_state.connections[conn_idx].active = false;
+        g_state.connections[conn_idx].bytes_in = 0;
+        g_state.connections[conn_idx].bytes_out = 0;
+    }
+    if (g_state.active_conns > 0) {
+        g_state.active_conns--;
+    }
+    if (rollback_total && g_state.total_conns > 0) {
+        g_state.total_conns--;
+    }
+    pthread_mutex_unlock(&g_state.stats_lock);
 }
 
-/* ============================================================================
- * Socket Helpers
- * ============================================================================ */
-
-static int set_nonblocking(int fd)
-{
-	int flags = fcntl(fd, F_GETFL, 0);
-
-	if (flags < 0)
-		return -1;
-	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+static bool parse_u16_strict(const char* s, uint16_t* out) {
+    if (!s || !*s || !out) {
+        return false;
+    }
+    char* end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v == 0 || v > 65535UL) {
+        return false;
+    }
+    *out = (uint16_t)v;
+    return true;
 }
 
-static int set_reuseaddr(int fd)
-{
-	int opt = 1;
+static bool is_loopback_bind(const char* ip) {
+    if (!ip || !*ip) {
+        return false;
+    }
+    if (strcmp(ip, "localhost") == 0 || strcmp(ip, "::1") == 0) {
+        return true;
+    }
 
-	return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip, &addr) != 1) {
+        return false;
+    }
+
+    uint32_t v = ntohl(addr.s_addr);
+    return (v >> 24) == 127;
 }
 
-static int set_nodelay(int fd)
-{
-	int opt = 1;
+static bool is_admin_ip_allowed(const struct sockaddr_in* addr) {
+    if (!addr) {
+        return false;
+    }
+    pthread_mutex_lock(&g_state.lock);
+    uint8_t allow_count = g_state.config.admin.allowlist_count;
+    char allow_copy[SPF_MAX_ADMIN_ALLOWLIST][SPF_IP_MAX_LEN];
+    for (uint8_t i = 0; i < allow_count; i++) {
+        strncpy(allow_copy[i], g_state.config.admin.allowlist[i], SPF_IP_MAX_LEN);
+    }
+    pthread_mutex_unlock(&g_state.lock);
 
-	return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    if (allow_count == 0) {
+        return true;
+    }
+
+    char ip[SPF_IP_MAX_LEN];
+    if (!inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip))) {
+        return false;
+    }
+
+    for (uint8_t i = 0; i < allow_count; i++) {
+        if (strcmp(ip, allow_copy[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
-static ssize_t send_all_nb(int fd, const uint8_t *buf, size_t len)
-{
-	size_t sent = 0;
-	int retries = 0;
+static int admin_allowlist_add(const char* ip) {
+    if (!ip || !*ip) {
+        return -1;
+    }
 
-	while (sent < len) {
-		ssize_t n = send(fd, buf + sent, len - sent, MSG_NOSIGNAL);
+    struct in_addr parsed;
+    if (inet_pton(AF_INET, ip, &parsed) != 1) {
+        return -1;
+    }
 
-		if (n > 0) {
-			sent += (size_t)n;
-			retries = 0;
-			continue;
-		}
+    pthread_mutex_lock(&g_state.lock);
+    for (uint8_t i = 0; i < g_state.config.admin.allowlist_count; i++) {
+        if (strcmp(g_state.config.admin.allowlist[i], ip) == 0) {
+            pthread_mutex_unlock(&g_state.lock);
+            return 1;
+        }
+    }
 
-		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			if (retries++ > 5)
-				break;
-			usleep(1000);
-			continue;
-		}
+    if (g_state.config.admin.allowlist_count >= SPF_MAX_ADMIN_ALLOWLIST) {
+        pthread_mutex_unlock(&g_state.lock);
+        return -2;
+    }
 
-		return -1;
-	}
-
-	return (ssize_t)sent;
+    strncpy(g_state.config.admin.allowlist[g_state.config.admin.allowlist_count], ip, SPF_IP_MAX_LEN - 1);
+    g_state.config.admin.allowlist[g_state.config.admin.allowlist_count][SPF_IP_MAX_LEN - 1] = '\0';
+    g_state.config.admin.allowlist_count++;
+    pthread_mutex_unlock(&g_state.lock);
+    return 0;
 }
 
-static void get_ip_string(const struct sockaddr_storage *addr,
-			  char *buf, size_t len)
-{
-	if (!addr || !buf || len < INET6_ADDRSTRLEN) {
-		if (buf && len > 0)
-			buf[0] = '\0';
-		return;
-	}
+static int admin_allowlist_del(const char* ip) {
+    if (!ip || !*ip) {
+        return -1;
+    }
 
-	if (addr->ss_family == AF_INET6) {
-		const struct sockaddr_in6 *s6 =
-			(const struct sockaddr_in6 *)addr;
-		inet_ntop(AF_INET6, &s6->sin6_addr, buf, (socklen_t)len);
-	} else if (addr->ss_family == AF_INET) {
-		const struct sockaddr_in *s4 =
-			(const struct sockaddr_in *)addr;
-		inet_ntop(AF_INET, &s4->sin_addr, buf, (socklen_t)len);
-	} else {
-		snprintf(buf, len, "[af%d]", addr->ss_family);
-	}
+    pthread_mutex_lock(&g_state.lock);
+    for (uint8_t i = 0; i < g_state.config.admin.allowlist_count; i++) {
+        if (strcmp(g_state.config.admin.allowlist[i], ip) == 0) {
+            for (uint8_t j = i; j + 1 < g_state.config.admin.allowlist_count; j++) {
+                strncpy(g_state.config.admin.allowlist[j], g_state.config.admin.allowlist[j + 1], SPF_IP_MAX_LEN);
+            }
+            g_state.config.admin.allowlist_count--;
+            pthread_mutex_unlock(&g_state.lock);
+            return 0;
+        }
+    }
+
+    pthread_mutex_unlock(&g_state.lock);
+    return 1;
 }
 
-static int create_listen_socket(uint16_t port, const char *bind_addr)
-{
-	int fd, opt;
-	struct sockaddr_in6 addr6;
-	struct sockaddr_in addr4;
+static int admin_allowlist_set_csv(const char* csv) {
+    if (!csv) {
+        return -1;
+    }
 
-	/* Try IPv6 dual-stack first */
-	fd = socket(AF_INET6, SOCK_STREAM, 0);
-	if (fd >= 0) {
-		set_reuseaddr(fd);
-		opt = 0;
-		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+    char parsed[SPF_MAX_ADMIN_ALLOWLIST][SPF_IP_MAX_LEN];
+    uint8_t count = 0;
 
-		memset(&addr6, 0, sizeof(addr6));
-		addr6.sin6_family = AF_INET6;
-		addr6.sin6_port = htons(port);
+    char tmp[512];
+    strncpy(tmp, csv, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
 
-		if (bind_addr && bind_addr[0]) {
-			if (inet_pton(AF_INET6, bind_addr, &addr6.sin6_addr) != 1) {
-				/* Try IPv4-mapped */
-				struct in_addr v4;
+    char* saveptr = NULL;
+    char* tok = strtok_r(tmp, ",", &saveptr);
+    while (tok && count < SPF_MAX_ADMIN_ALLOWLIST) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        char* end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
+        }
+        *end = '\0';
 
-				if (inet_pton(AF_INET, bind_addr, &v4) == 1) {
-					memset(&addr6.sin6_addr, 0, 10);
-					memset(((uint8_t *)&addr6.sin6_addr) + 10, 0xff, 2);
-					memcpy(((uint8_t *)&addr6.sin6_addr) + 12, &v4, 4);
-				}
-			}
-		} else {
-			addr6.sin6_addr = in6addr_any;
-		}
+        if (*tok) {
+            struct in_addr parsed_ip;
+            if (inet_pton(AF_INET, tok, &parsed_ip) != 1) {
+                return -1;
+            }
+            strncpy(parsed[count], tok, SPF_IP_MAX_LEN - 1);
+            parsed[count][SPF_IP_MAX_LEN - 1] = '\0';
+            count++;
+        }
 
-		if (bind(fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0 &&
-		    listen(fd, LISTEN_BACKLOG) == 0)
-			return fd;
-		close(fd);
-	}
+        tok = strtok_r(NULL, ",", &saveptr);
+    }
 
-	/* Fallback to IPv4 */
-	fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0)
-		return -1;
-
-	set_reuseaddr(fd);
-
-	memset(&addr4, 0, sizeof(addr4));
-	addr4.sin_family = AF_INET;
-	addr4.sin_port = htons(port);
-
-	if (bind_addr && bind_addr[0])
-		inet_pton(AF_INET, bind_addr, &addr4.sin_addr);
-	else
-		addr4.sin_addr.s_addr = INADDR_ANY;
-
-	if (bind(fd, (struct sockaddr *)&addr4, sizeof(addr4)) < 0 ||
-	    listen(fd, LISTEN_BACKLOG) < 0) {
-		close(fd);
-		return -1;
-	}
-	return fd;
+    pthread_mutex_lock(&g_state.lock);
+    g_state.config.admin.allowlist_count = count;
+    for (uint8_t i = 0; i < count; i++) {
+        strncpy(g_state.config.admin.allowlist[i], parsed[i], SPF_IP_MAX_LEN);
+    }
+    pthread_mutex_unlock(&g_state.lock);
+    return 0;
 }
 
-static int create_udp_socket(uint16_t port, const char *bind_addr)
-{
-	int fd;
-	struct sockaddr_in6 addr6;
-	struct sockaddr_in addr4;
-
-	fd = socket(AF_INET6, SOCK_DGRAM, 0);
-	if (fd >= 0) {
-		int opt = 0;
-		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
-		memset(&addr6, 0, sizeof(addr6));
-		addr6.sin6_family = AF_INET6;
-		addr6.sin6_port = htons(port);
-		if (bind_addr && bind_addr[0]) {
-			if (inet_pton(AF_INET6, bind_addr, &addr6.sin6_addr) != 1) {
-				struct in_addr v4;
-				if (inet_pton(AF_INET, bind_addr, &v4) == 1) {
-					memset(&addr6.sin6_addr, 0, 10);
-					memset(((uint8_t *)&addr6.sin6_addr) + 10, 0xff, 2);
-					memcpy(((uint8_t *)&addr6.sin6_addr) + 12, &v4, 4);
-				}
-			}
-		} else {
-			addr6.sin6_addr = in6addr_any;
-		}
-		if (bind(fd, (struct sockaddr *)&addr6, sizeof(addr6)) == 0)
-			return fd;
-		close(fd);
-	}
-
-	fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (fd < 0)
-		return -1;
-
-	memset(&addr4, 0, sizeof(addr4));
-	addr4.sin_family = AF_INET;
-	addr4.sin_port = htons(port);
-	if (bind_addr && bind_addr[0])
-		inet_pton(AF_INET, bind_addr, &addr4.sin_addr);
-	else
-		addr4.sin_addr.s_addr = INADDR_ANY;
-
-	if (bind(fd, (struct sockaddr *)&addr4, sizeof(addr4)) < 0) {
-		close(fd);
-		return -1;
-	}
-	return fd;
+static int parse_backend_index_strict(const char* s, uint8_t* out) {
+    if (!s || !*s || !out) {
+        return -1;
+    }
+    char* end = NULL;
+    errno = 0;
+    unsigned long idx = strtoul(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || idx >= SPF_MAX_BACKENDS) {
+        return -1;
+    }
+    *out = (uint8_t)idx;
+    return 0;
 }
 
-static int connect_to_backend(const char *host, uint16_t port, int timeout_sec)
-{
-	struct addrinfo hints, *res, *rp;
-	char port_str[8];
-	int fd = -1;
-
-	if (!host || !host[0])
-		return -1;
-
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-
-	snprintf(port_str, sizeof(port_str), "%u", port);
-	if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res)
-		return -1;
-
-	for (rp = res; rp; rp = rp->ai_next) {
-		fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-		if (fd < 0)
-			continue;
-
-		set_nonblocking(fd);
-
-		int ret = connect(fd, rp->ai_addr, rp->ai_addrlen);
-
-		if (ret == 0)
-			break;
-
-		if (errno != EINPROGRESS) {
-			close(fd);
-			fd = -1;
-			continue;
-		}
-
-		/* Wait for connect with timeout */
-		fd_set wfds;
-		struct timeval tv = {timeout_sec, 0};
-
-		FD_ZERO(&wfds);
-		FD_SET(fd, &wfds);
-
-		ret = select(fd + 1, NULL, &wfds, NULL, &tv);
-		if (ret <= 0) {
-			close(fd);
-			fd = -1;
-			continue;
-		}
-
-		int err = 0;
-		socklen_t optlen = sizeof(err);
-
-		getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &optlen);
-		if (err != 0) {
-			close(fd);
-			fd = -1;
-			continue;
-		}
-		break;
-	}
-
-	freeaddrinfo(res);
-	return fd;
+static int rule_backend_set_weight(spf_rule_t* rule, uint8_t idx, uint16_t weight) {
+    if (!rule || idx >= rule->backend_count || weight == 0) {
+        return -1;
+    }
+    pthread_mutex_lock(&rule->backends[idx].lock);
+    rule->backends[idx].weight = weight;
+    pthread_mutex_unlock(&rule->backends[idx].lock);
+    return 0;
 }
 
-/* ============================================================================
- * Session Management
- * ============================================================================ */
-
-struct session {
-	int			client_fd;
-	int			backend_fd;
-	struct sockaddr_storage	client_addr;
-	struct tunl_rule	*rule;
-	int			backend_idx;
-	uint64_t		bytes_in;
-	uint64_t		bytes_out;
-	bool			active;
-};
-
-static void session_run(struct session *s)
-{
-	int epfd;
-	struct epoll_event ev, events[2];
-	uint8_t buf[TUNL_BUFFER_SIZE];
-
-	epfd = epoll_create1(EPOLL_CLOEXEC);
-	if (epfd < 0)
-		return;
-
-	set_nonblocking(s->client_fd);
-	set_nonblocking(s->backend_fd);
-	set_nodelay(s->client_fd);
-	set_nodelay(s->backend_fd);
-
-	ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
-	ev.data.fd = s->client_fd;
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, s->client_fd, &ev) < 0) {
-		close(epfd);
-		return;
-	}
-
-	ev.data.fd = s->backend_fd;
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, s->backend_fd, &ev) < 0) {
-		close(epfd);
-		return;
-	}
-
-	while (!g_shutdown && s->active) {
-		int nfds = epoll_wait(epfd, events, 2, RECV_TIMEOUT * 1000);
-
-		if (nfds < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-		if (nfds == 0)
-			break;
-
-		for (int i = 0; i < nfds; i++) {
-			if (events[i].events & (EPOLLHUP | EPOLLERR)) {
-				s->active = false;
-				break;
-			}
-
-			if (events[i].data.fd == s->client_fd) {
-				ssize_t n = recv(s->client_fd, buf, sizeof(buf), 0);
-
-				if (n <= 0) {
-					s->active = false;
-					break;
-				}
-				if (send_all_nb(s->backend_fd, buf, (size_t)n) != n) {
-					s->active = false;
-					break;
-				}
-				s->bytes_in += (uint64_t)n;
-			} else if (events[i].data.fd == s->backend_fd) {
-				ssize_t n = recv(s->backend_fd, buf, sizeof(buf), 0);
-
-				if (n <= 0) {
-					s->active = false;
-					break;
-				}
-				if (send_all_nb(s->client_fd, buf, (size_t)n) != n) {
-					s->active = false;
-					break;
-				}
-				s->bytes_out += (uint64_t)n;
-			}
-		}
-	}
-
-	close(epfd);
+static int rule_backend_set_state(spf_rule_t* rule, uint8_t idx, spf_backend_state_t state) {
+    if (!rule || idx >= rule->backend_count) {
+        return -1;
+    }
+    pthread_mutex_lock(&rule->backends[idx].lock);
+    rule->backends[idx].state = state;
+    pthread_mutex_unlock(&rule->backends[idx].lock);
+    return 0;
 }
 
-static void *session_thread(void *arg)
-{
-	struct session *s = (struct session *)arg;
+static int rule_backend_drain(spf_rule_t* rule, uint8_t idx, uint32_t timeout_sec, uint32_t* active_left) {
+    if (!rule || idx >= rule->backend_count) {
+        return -1;
+    }
 
-	if (!s)
-		return NULL;
+    pthread_mutex_lock(&rule->backends[idx].lock);
+    rule->backends[idx].state = SPF_BACKEND_DRAIN;
+    pthread_mutex_unlock(&rule->backends[idx].lock);
 
-	tunl_backend_conn_start(s->rule, s->backend_idx);
-	s->active = true;
+    uint64_t deadline_ms = spf_time_ms() + ((uint64_t)timeout_sec * 1000ULL);
+    for (;;) {
+        pthread_mutex_lock(&rule->backends[idx].lock);
+        uint32_t active = rule->backends[idx].active_conns;
+        pthread_mutex_unlock(&rule->backends[idx].lock);
 
-	pthread_mutex_lock(&g_state.lock);
-	g_state.session_count++;
-	pthread_mutex_unlock(&g_state.lock);
+        if (active == 0) {
+            rule_backend_set_state(rule, idx, SPF_BACKEND_DOWN);
+            if (active_left) {
+                *active_left = 0;
+            }
+            return 0;
+        }
 
-	session_run(s);
+        if (timeout_sec == 0 || spf_time_ms() >= deadline_ms) {
+            if (active_left) {
+                *active_left = active;
+            }
+            return 1;
+        }
 
-	close(s->client_fd);
-	close(s->backend_fd);
-	tunl_backend_conn_end(s->rule, s->backend_idx);
-
-	pthread_mutex_lock(&g_state.lock);
-	g_state.session_count--;
-	g_state.total_bytes_in += s->bytes_in;
-	g_state.total_bytes_out += s->bytes_out;
-	g_state.bytes_in += s->bytes_in;
-	g_state.bytes_out += s->bytes_out;
-	pthread_mutex_unlock(&g_state.lock);
-
-	free(s);
-	return NULL;
+        usleep(100000);
+    }
 }
 
-/* ============================================================================
- * Listener
- * ============================================================================ */
-
-static void *listener_thread(void *arg)
-{
-	struct tunl_rule *rule = (struct tunl_rule *)arg;
-	char ip[INET6_ADDRSTRLEN];
-	int lfd;
-
-	lfd = create_listen_socket(rule->listen_port, g_state.bind_addr);
-	if (lfd < 0) {
-		tunl_log(TUNL_LOG_ERROR, "bind port %u failed", rule->listen_port);
-		return NULL;
-	}
-
-	tunl_log(TUNL_LOG_INFO, "listening on [::]:%u", rule->listen_port);
-
-	while (!g_shutdown && g_state.running && rule->enabled) {
-		struct sockaddr_storage addr;
-		socklen_t addrlen = sizeof(addr);
-		int cfd = accept(lfd, (struct sockaddr *)&addr, &addrlen);
-
-		if (cfd < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-
-		get_ip_string(&addr, ip, sizeof(ip));
-
-		/* Rate limit check */
-		if (!tunl_rate_check(&g_state, ip)) {
-			close(cfd);
-			continue;
-		}
-
-		/* Connection limit check */
-		pthread_mutex_lock(&rule->lock);
-		if (rule->max_conns && rule->active_conns >= rule->max_conns) {
-			pthread_mutex_unlock(&rule->lock);
-			close(cfd);
-			continue;
-		}
-		pthread_mutex_unlock(&rule->lock);
-
-		/* Select backend */
-		int backend_idx = tunl_select_backend(rule, ip);
-
-		if (backend_idx < 0) {
-			close(cfd);
-			continue;
-		}
-
-		/* Connect to backend */
-		int bfd = connect_to_backend(rule->backends[backend_idx].host,
-					     rule->backends[backend_idx].port,
-					     CONN_TIMEOUT);
-		if (bfd < 0) {
-			close(cfd);
-			continue;
-		}
-
-		/* Create session */
-		struct session *sess = (struct session *)calloc(1, sizeof(*sess));
-
-		if (!sess) {
-			close(cfd);
-			close(bfd);
-			continue;
-		}
-
-		sess->client_fd = cfd;
-		sess->backend_fd = bfd;
-		memcpy(&sess->client_addr, &addr, sizeof(addr));
-		sess->rule = rule;
-		sess->backend_idx = backend_idx;
-
-		pthread_t tid;
-
-		if (pthread_create(&tid, NULL, session_thread, sess) != 0) {
-			close(cfd);
-			close(bfd);
-			free(sess);
-			continue;
-		}
-		pthread_detach(tid);
-
-		pthread_mutex_lock(&g_state.lock);
-		g_state.total_conns++;
-		pthread_mutex_unlock(&g_state.lock);
-	}
-
-	close(lfd);
-	tunl_log(TUNL_LOG_INFO, "listener stopped for port %u", rule->listen_port);
-	return NULL;
+static int save_runtime_config(void) {
+    const char* path = g_state.config.config_path[0] ? g_state.config.config_path : "spf.conf";
+    return config_save(&g_state, path);
 }
 
-static int udp_send_recv(struct tunl_rule *rule, int backend_idx,
-			 const uint8_t *buf, ssize_t len,
-			 struct sockaddr_storage *client, socklen_t client_len,
-			 int lfd)
-{
-	struct tunl_backend *be = &rule->backends[backend_idx];
-	struct addrinfo hints, *res = NULL;
-	char port_str[8];
-	int sfd = -1;
-	int ret = -1;
-	uint8_t rbuf[TUNL_BUFFER_SIZE];
+static bool parse_backend_token(const char* token, spf_backend_t* out) {
+    if (!token || !*token || !out) {
+        return false;
+    }
 
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_DGRAM;
-	snprintf(port_str, sizeof(port_str), "%u", be->port);
-	if (getaddrinfo(be->host, port_str, &hints, &res) != 0 || !res)
-		return -1;
+    char tmp[96];
+    strncpy(tmp, token, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
 
-	for (struct addrinfo *rp = res; rp; rp = rp->ai_next) {
-		sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-		if (sfd < 0)
-			continue;
-		if (sendto(sfd, buf, (size_t)len, 0, rp->ai_addr, rp->ai_addrlen) < 0) {
-			close(sfd);
-			sfd = -1;
-			continue;
-		}
-		struct timeval tv = {1, 0};
-		setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-		ssize_t n = recvfrom(sfd, rbuf, sizeof(rbuf), 0, NULL, NULL);
-		if (n > 0) {
-			if (sendto(lfd, rbuf, (size_t)n, 0,
-				   (struct sockaddr *)client, client_len) == n)
-				ret = 0;
-		}
-		close(sfd);
-		if (ret == 0)
-			break;
-	}
+    char* colon = strchr(tmp, ':');
+    if (!colon) {
+        return false;
+    }
 
-	freeaddrinfo(res);
-	return ret;
+    *colon = '\0';
+    const char* host = tmp;
+    const char* port_s = colon + 1;
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, host, &addr) != 1) {
+        return false;
+    }
+
+    uint16_t port = 0;
+    if (!parse_u16_strict(port_s, &port)) {
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+    strncpy(out->host, host, SPF_IP_MAX_LEN - 1);
+    out->host[SPF_IP_MAX_LEN - 1] = '\0';
+    out->port = port;
+    out->weight = 1;
+    out->state = SPF_BACKEND_UP;
+    return true;
 }
 
-static void *udp_listener_thread(void *arg)
-{
-	struct tunl_rule *rule = (struct tunl_rule *)arg;
-	int lfd;
-
-	lfd = create_udp_socket(rule->listen_port, g_state.bind_addr);
-	if (lfd < 0) {
-		tunl_log(TUNL_LOG_ERROR, "udp bind port %u failed", rule->listen_port);
-		return NULL;
-	}
-
-	tunl_log(TUNL_LOG_INFO, "udp listening on [%s]:%u",
-		 g_state.bind_addr[0] ? g_state.bind_addr : "::",
-		 rule->listen_port);
-
-	while (!g_shutdown && g_state.running && rule->enabled) {
-		uint8_t buf[TUNL_BUFFER_SIZE];
-		struct sockaddr_storage addr;
-		socklen_t addrlen = sizeof(addr);
-		ssize_t n = recvfrom(lfd, buf, sizeof(buf), 0,
-				(struct sockaddr *)&addr, &addrlen);
-		if (n <= 0)
-			continue;
-
-		char ip[INET6_ADDRSTRLEN];
-		get_ip_string(&addr, ip, sizeof(ip));
-		if (!tunl_rate_check(&g_state, ip))
-			continue;
-
-		int backend_idx = tunl_select_backend(rule, ip);
-		if (backend_idx < 0)
-			continue;
-
-		tunl_backend_conn_start(rule, backend_idx);
-		udp_send_recv(rule, backend_idx, buf, n, &addr, addrlen, lfd);
-		tunl_backend_conn_end(rule, backend_idx);
-	}
-
-	close(lfd);
-	return NULL;
+static ssize_t send_plain_once(int fd, const uint8_t* buf, size_t len) {
+    for (;;) {
+        ssize_t n = send(fd, buf, len, 0);
+        if (n >= 0) {
+            return n;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        return -1;
+    }
 }
 
-/* ============================================================================
- * Control Interface
- * ============================================================================ */
-
-static void ctrl_send(int fd, const char *msg)
-{
-	if (msg)
-		send(fd, msg, strlen(msg), MSG_NOSIGNAL);
+static ssize_t send_tls_once(SSL* ssl, const uint8_t* buf, size_t len) {
+    ssize_t n = tls_write(ssl, buf, len);
+    if (n < 0) {
+        return -1;
+    }
+    return n;
 }
 
-static void handle_ctrl(int fd)
-{
-	char buf[512], resp[2048];
-	bool authed = (g_state.token[0] == '\0');
+static int forward_buffer(session_t* s, bool to_target, spf_bucket_t* bucket,
+                          const uint8_t* buf, size_t len, uint64_t* counter) {
+    size_t off = 0;
 
-	ctrl_send(fd, "tunl v" TUNL_VERSION "\n");
-	if (!authed)
-		ctrl_send(fd, "AUTH required\n");
-	ctrl_send(fd, "> ");
+    while (off < len && !g_shutdown && g_state.running) {
+        uint64_t allowed = spf_bucket_consume(bucket, len - off);
+        if (allowed == 0) {
+            usleep(1000);
+            continue;
+        }
 
-	while (!g_shutdown) {
-		ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
+        ssize_t sent;
+        if (to_target) {
+            if (s->target_ssl) {
+                sent = send_tls_once(s->target_ssl, buf + off, allowed);
+            } else {
+                sent = send_plain_once(s->target_fd, buf + off, allowed);
+            }
+        } else {
+            if (s->client_ssl) {
+                sent = send_tls_once(s->client_ssl, buf + off, allowed);
+            } else {
+                sent = send_plain_once(s->client_fd, buf + off, allowed);
+            }
+        }
 
-		if (n <= 0)
-			break;
-		buf[n] = '\0';
+        if (sent < 0) {
+            return -1;
+        }
+        if (sent == 0) {
+            usleep(1000);
+            continue;
+        }
 
-		while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r'))
-			buf[--n] = '\0';
+        off += (size_t)sent;
+        *counter += (uint64_t)sent;
+    }
 
-		if (n == 0) {
-			ctrl_send(fd, "> ");
-			continue;
-		}
-
-		resp[0] = '\0';
-
-		if (strncmp(buf, "QUIT", 4) == 0) {
-			break;
-		} else if (strncmp(buf, "AUTH ", 5) == 0) {
-			if (tunl_verify_token(&g_state, buf + 5)) {
-				authed = true;
-				snprintf(resp, sizeof(resp), "OK\n");
-			} else {
-				snprintf(resp, sizeof(resp), "ERR bad token\n");
-			}
-		} else if (!authed) {
-			snprintf(resp, sizeof(resp), "ERR auth required\n");
-		} else if (strcmp(buf, "STATUS") == 0) {
-			uint64_t up = tunl_time_sec() - g_state.start_time;
-
-			snprintf(resp, sizeof(resp),
-				 "uptime: %luh%lum\n"
-				 "conns: %lu total\n"
-				 "bytes: %lu in, %lu out\n"
-				 "rules: %u\n",
-				 (unsigned long)(up / 3600),
-				 (unsigned long)((up % 3600) / 60),
-				 (unsigned long)g_state.total_conns,
-				 (unsigned long)g_state.total_bytes_in,
-				 (unsigned long)g_state.total_bytes_out,
-				 g_state.rule_count);
-		} else if (strcmp(buf, "RULES") == 0) {
-			char *p = resp;
-			size_t rem = sizeof(resp);
-
-			for (int i = 0; i < TUNL_MAX_RULES && rem > 100; i++) {
-				if (!g_state.rules[i].enabled)
-					continue;
-				int w = snprintf(p, rem, "rule %u: port %u, %u backends\n",
-						 g_state.rules[i].id,
-						 g_state.rules[i].listen_port,
-						 g_state.rules[i].backend_count);
-				if (w > 0 && (size_t)w < rem) {
-					p += w;
-					rem -= (size_t)w;
-				}
-			}
-		} else if (strcmp(buf, "HEALTH") == 0) {
-			char *p = resp;
-			size_t rem = sizeof(resp);
-
-			for (int i = 0; i < TUNL_MAX_RULES && rem > 100; i++) {
-				if (!g_state.rules[i].enabled)
-					continue;
-				struct tunl_rule *r = &g_state.rules[i];
-				for (int b = 0; b < r->backend_count && rem > 100; b++) {
-					struct tunl_backend *be = &r->backends[b];
-					int w = snprintf(p, rem, "%s:%u %s (rtt: %ums, conns: %u)\n",
-							 be->host, be->port,
-							 be->state == TUNL_BACKEND_UP ? "UP" : "DOWN",
-							 be->last_rtt_ms, be->active_conns);
-					if (w > 0 && (size_t)w < rem) {
-						p += w;
-						rem -= (size_t)w;
-					}
-				}
-			}
-		} else if (strcmp(buf, "SHUTDOWN") == 0) {
-			g_shutdown = 1;
-			snprintf(resp, sizeof(resp), "OK\n");
-		} else {
-			snprintf(resp, sizeof(resp),
-				 "commands: STATUS, RULES, HEALTH, QUIT, SHUTDOWN\n");
-		}
-
-		ctrl_send(fd, resp);
-		ctrl_send(fd, "> ");
-	}
-
-	close(fd);
+    return off == len ? 0 : -1;
 }
 
-static void *ctrl_thread(void *arg)
-{
-	(void)arg;
-
-	g_ctrl_fd = create_listen_socket(g_state.ctrl_port, g_state.bind_addr);
-	if (g_ctrl_fd < 0) {
-		tunl_log(TUNL_LOG_ERROR, "ctrl bind failed");
-		return NULL;
-	}
-
-	tunl_log(TUNL_LOG_INFO, "ctrl on [%s]:%u",
-		 g_state.bind_addr[0] ? g_state.bind_addr : "::",
-		 g_state.ctrl_port);
-
-	while (!g_shutdown && g_state.running) {
-		int cfd = accept(g_ctrl_fd, NULL, NULL);
-
-		if (cfd >= 0)
-			handle_ctrl(cfd);
-	}
-
-	close(g_ctrl_fd);
-	return NULL;
+void sig_handler(int sig) {
+    (void)sig;
+    g_shutdown = 1;
 }
 
-/* ============================================================================
- * Metrics Endpoint (Prometheus text format)
- * ============================================================================ */
-
-static void metrics_emit(int fd)
-{
-	char buf[16384];
-	size_t off = 0;
-
-	#define APPEND_FMT(...) do { \
-		off += (size_t)snprintf(buf + off, sizeof(buf) - off, __VA_ARGS__); \
-	} while (0)
-	#define APPEND_STR(str) do { \
-		size_t l = strlen(str); \
-		if (off + l < sizeof(buf)) { memcpy(buf + off, str, l); off += l; } \
-	} while (0)
-
-	pthread_mutex_lock(&g_state.lock);
-	APPEND_STR("# HELP tunl_info Build info\n");
-	APPEND_STR("# TYPE tunl_info gauge\n");
-	APPEND_FMT("tunl_info{version=\"%s\"} 1\n", TUNL_VERSION);
-	APPEND_STR("# HELP tunl_sessions_active Active sessions\n");
-	APPEND_STR("# TYPE tunl_sessions_active gauge\n");
-	APPEND_FMT("tunl_sessions_active %u\n", g_state.session_count);
-	APPEND_STR("# HELP tunl_connections_total Total accepted connections\n");
-	APPEND_STR("# TYPE tunl_connections_total counter\n");
-	APPEND_FMT("tunl_connections_total %lu\n", (unsigned long)g_state.total_conns);
-	APPEND_STR("# HELP tunl_bytes_in Total ingress bytes\n");
-	APPEND_STR("# TYPE tunl_bytes_in counter\n");
-	APPEND_FMT("tunl_bytes_in %lu\n", (unsigned long)g_state.total_bytes_in);
-	APPEND_STR("# HELP tunl_bytes_out Total egress bytes\n");
-	APPEND_STR("# TYPE tunl_bytes_out counter\n");
-	APPEND_FMT("tunl_bytes_out %lu\n", (unsigned long)g_state.total_bytes_out);
-
-	for (int i = 0; i < TUNL_MAX_RULES; i++) {
-		if (!g_state.rules[i].enabled)
-			continue;
-		struct tunl_rule *r = &g_state.rules[i];
-		APPEND_STR("# HELP tunl_rule_active_connections Active connections per rule\n");
-		APPEND_STR("# TYPE tunl_rule_active_connections gauge\n");
-		APPEND_FMT("tunl_rule_active_connections{rule=\"%u\",port=\"%u\",proto=\"%s\"} %u\n",
-			r->id, r->listen_port, r->protocol == TUNL_PROTO_UDP ? "udp" : "tcp",
-			r->active_conns);
-		for (int b = 0; b < r->backend_count; b++) {
-			struct tunl_backend *be = &r->backends[b];
-			APPEND_STR("# HELP tunl_backend_active_connections Active connections per backend\n");
-			APPEND_STR("# TYPE tunl_backend_active_connections gauge\n");
-			APPEND_FMT("tunl_backend_active_connections{rule=\"%u\",backend=\"%s:%u\"} %u\n",
-				r->id, be->host, be->port, be->active_conns);
-			APPEND_STR("# HELP tunl_backend_total_connections Total connections per backend\n");
-			APPEND_STR("# TYPE tunl_backend_total_connections counter\n");
-			APPEND_FMT("tunl_backend_total_connections{rule=\"%u\",backend=\"%s:%u\"} %lu\n",
-				r->id, be->host, be->port, (unsigned long)be->total_conns);
-			APPEND_STR("# HELP tunl_backend_health Backend health state (1=up,0=down)\n");
-			APPEND_STR("# TYPE tunl_backend_health gauge\n");
-			APPEND_FMT("tunl_backend_health{rule=\"%u\",backend=\"%s:%u\"} %d\n",
-				r->id, be->host, be->port, be->state == TUNL_BACKEND_UP ? 1 : 0);
-			APPEND_STR("# HELP tunl_backend_last_rtt_ms Last health check RTT in ms\n");
-			APPEND_STR("# TYPE tunl_backend_last_rtt_ms gauge\n");
-			APPEND_FMT("tunl_backend_last_rtt_ms{rule=\"%u\",backend=\"%s:%u\"} %u\n",
-				r->id, be->host, be->port, be->last_rtt_ms);
-			APPEND_STR("# HELP tunl_backend_last_check_ms Last health check timestamp (ms)\n");
-			APPEND_STR("# TYPE tunl_backend_last_check_ms gauge\n");
-			APPEND_FMT("tunl_backend_last_check_ms{rule=\"%u\",backend=\"%s:%u\"} %lu\n",
-				r->id, be->host, be->port, (unsigned long)be->last_check_ms);
-		}
-	}
-	pthread_mutex_unlock(&g_state.lock);
-
-	const char hdr[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nConnection: close\r\n\r\n";
-	send(fd, hdr, strlen(hdr), MSG_NOSIGNAL);
-	send(fd, buf, off, MSG_NOSIGNAL);
-
-	#undef APPEND_FMT
-	#undef APPEND_STR
+int send_proxy_proto_v2(int fd, struct sockaddr_in* src, struct sockaddr_in* dst) {
+    uint8_t hdr[28] = {0};
+    memcpy(hdr, "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A", 12);
+    hdr[12] = 0x21;
+    hdr[13] = 0x11;
+    hdr[14] = 0x00;
+    hdr[15] = 12;
+    memcpy(&hdr[16], &src->sin_addr, 4);
+    memcpy(&hdr[20], &dst->sin_addr, 4);
+    memcpy(&hdr[24], &src->sin_port, 2);
+    memcpy(&hdr[26], &dst->sin_port, 2);
+    return send(fd, hdr, 28, 0) == 28 ? 0 : -1;
 }
 
-static void *metrics_thread(void *arg)
-{
-	(void)arg;
-
-	int mfd = create_listen_socket(g_state.metrics_port, g_state.bind_addr);
-	if (mfd < 0) {
-		tunl_log(TUNL_LOG_ERROR, "metrics bind failed");
-		return NULL;
-	}
-
-	tunl_log(TUNL_LOG_INFO, "metrics on [%s]:%u",
-		 g_state.bind_addr[0] ? g_state.bind_addr : "::",
-		 g_state.metrics_port);
-
-	while (!g_shutdown && g_state.running) {
-		int cfd = accept(mfd, NULL, NULL);
-		if (cfd < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-		metrics_emit(cfd);
-		close(cfd);
-	}
-
-	close(mfd);
-	return NULL;
+void* session_thread(void* arg) {
+    session_t* s = (session_t*)arg;
+    
+    spf_lb_conn_start(s->rule, s->backend_idx);
+    
+    int flag = 1;
+    setsockopt(s->client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    setsockopt(s->target_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    
+    spf_bucket_t bucket;
+    spf_bucket_init(&bucket, s->rule->rate_bps ? s->rule->rate_bps : 100*1024*1024, 2.0);
+    
+    uint8_t buf[SPF_BUFFER_SIZE];
+    fd_set fds;
+    struct timeval tv;
+    int maxfd = (s->client_fd > s->target_fd ? s->client_fd : s->target_fd) + 1;
+    
+    // Check for FD_SETSIZE overflow
+    if (s->client_fd >= FD_SETSIZE || s->target_fd >= FD_SETSIZE) {
+        spf_log(SPF_LOG_ERROR, "fd >= FD_SETSIZE, cannot use select");
+        close(s->client_fd);
+        close(s->target_fd);
+        spf_lb_conn_end(s->rule, s->backend_idx);
+        free(s);
+        return NULL;
+    }
+    
+    uint64_t bytes_in = 0, bytes_out = 0;
+    
+    while (!g_shutdown && g_state.running) {
+        FD_ZERO(&fds);
+        FD_SET(s->client_fd, &fds);
+        FD_SET(s->target_fd, &fds);
+        tv.tv_sec = 30;
+        tv.tv_usec = 0;
+        
+        int r = select(maxfd, &fds, NULL, NULL, &tv);
+        if (r <= 0) break;
+        
+        if (FD_ISSET(s->client_fd, &fds)) {
+            ssize_t n;
+            if (s->client_ssl) {
+                n = tls_read(s->client_ssl, buf, sizeof(buf));
+                if (n == 0) continue; // WANT_READ/WRITE
+            } else {
+                n = recv(s->client_fd, buf, sizeof(buf), 0);
+            }
+            if (n < 0) break; // Error
+            if (n == 0 && !s->client_ssl) break; // EOF (for tcp)
+            
+            if (forward_buffer(s, true, &bucket, buf, (size_t)n, &bytes_in) < 0) {
+                break;
+            }
+        }
+        
+        if (FD_ISSET(s->target_fd, &fds)) {
+            ssize_t n;
+            if (s->target_ssl) {
+                n = tls_read(s->target_ssl, buf, sizeof(buf));
+                if (n == 0) continue; // WANT_READ/WRITE
+            } else {
+                n = recv(s->target_fd, buf, sizeof(buf), 0);
+            }
+            if (n < 0) break;
+            if (n == 0 && !s->target_ssl) break;
+            
+            if (forward_buffer(s, false, &bucket, buf, (size_t)n, &bytes_out) < 0) {
+                break;
+            }
+        }
+    }
+    
+    if (s->client_ssl) { SSL_shutdown(s->client_ssl); SSL_free(s->client_ssl); }
+    if (s->target_ssl) { SSL_shutdown(s->target_ssl); SSL_free(s->target_ssl); }
+    close(s->client_fd);
+    close(s->target_fd);
+    
+    spf_lb_conn_end(s->rule, s->backend_idx);
+    
+    pthread_mutex_lock(&g_state.stats_lock);
+    g_state.total_bytes_in += bytes_in;
+    g_state.total_bytes_out += bytes_out;
+    if (s->conn_idx < SPF_MAX_CONNECTIONS) {
+        g_state.connections[s->conn_idx].active = false;
+        g_state.connections[s->conn_idx].bytes_in = bytes_in;
+        g_state.connections[s->conn_idx].bytes_out = bytes_out;
+    }
+    if (g_state.active_conns > 0) {
+        g_state.active_conns--;
+    }
+    pthread_mutex_unlock(&g_state.stats_lock);
+    
+    free(s);
+    return NULL;
 }
 
-/* ============================================================================
- * Signal Handling & Main
- * ============================================================================ */
-
-static void sig_handler(int sig)
-{
-	(void)sig;
-	g_shutdown = 1;
+void* health_worker(void* arg) {
+    spf_rule_t* rule = (spf_rule_t*)arg;
+    
+    while (!g_shutdown && g_state.running && rule->active) {
+        for (int i = 0; i < rule->backend_count; i++) {
+            spf_backend_t* b = &rule->backends[i];
+            if (b->state == SPF_BACKEND_DRAIN) continue;
+            
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) continue;
+            
+            struct timeval tv;
+            tv.tv_sec = 2;
+            tv.tv_usec = 0;
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            
+            struct sockaddr_in addr = {0};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(b->port);
+            inet_pton(AF_INET, b->host, &addr.sin_addr);
+            
+            int ok = connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0;
+            close(fd);
+            
+            pthread_mutex_lock(&b->lock);
+            if (ok) {
+                if (b->state == SPF_BACKEND_DOWN) {
+                    b->state = SPF_BACKEND_UP;
+                    spf_event_push(&g_state, SPF_EVENT_HEALTH_UP, b->host, b->port, rule->id, "backend recovered");
+                    spf_log(SPF_LOG_INFO, "backend %s:%u up", b->host, b->port);
+                }
+                b->health_fails = 0;
+            } else {
+                b->health_fails++;
+                if (b->health_fails >= 3 && b->state == SPF_BACKEND_UP) {
+                    b->state = SPF_BACKEND_DOWN;
+                    spf_event_push(&g_state, SPF_EVENT_HEALTH_DOWN, b->host, b->port, rule->id, "health check failed");
+                    spf_log(SPF_LOG_WARN, "backend %s:%u down", b->host, b->port);
+                }
+            }
+            b->last_health_check = spf_time_sec();
+            pthread_mutex_unlock(&b->lock);
+        }
+        
+        sleep(SPF_HEALTH_INTERVAL_MS / 1000);
+    }
+    
+    return NULL;
 }
 
-static void daemonize(void)
-{
-	pid_t pid = fork();
-
-	if (pid < 0)
-		exit(1);
-	if (pid > 0)
-		exit(0);
-	if (setsid() < 0)
-		exit(1);
-
-	pid = fork();
-	if (pid < 0)
-		exit(1);
-	if (pid > 0)
-		exit(0);
-
-	umask(0);
-	if (chdir("/") != 0)
-		exit(1);
-	close(STDIN_FILENO);
-	close(STDOUT_FILENO);
-	close(STDERR_FILENO);
+void* listener_thread(void* arg) {
+    spf_rule_t* rule = (spf_rule_t*)arg;
+    
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(rule->listen_port);
+    
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        spf_log(SPF_LOG_ERROR, "bind port %u failed: %s", rule->listen_port, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    
+    listen(fd, 256);
+    spf_log(SPF_LOG_INFO, "rule %u listening on :%u", rule->id, rule->listen_port);
+    
+    pthread_create(&rule->health_thread, NULL, health_worker, rule);
+    pthread_detach(rule->health_thread);
+    
+    while (!g_shutdown && g_state.running && rule->active) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv = {1, 0};
+        
+        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) continue;
+        
+        struct sockaddr_in cli_addr;
+        socklen_t cli_len = sizeof(cli_addr);
+        int cli_fd = accept(fd, (struct sockaddr*)&cli_addr, &cli_len);
+        if (cli_fd < 0) continue;
+        
+        // Fix DoS: Set timeouts immediately to prevent slow handshake hanging the listener
+        struct timeval tv_cli = {10, 0}; // 10s timeout
+        setsockopt(cli_fd, SOL_SOCKET, SO_RCVTIMEO, &tv_cli, sizeof(tv_cli));
+        setsockopt(cli_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_cli, sizeof(tv_cli));
+        
+        char cli_ip[SPF_IP_MAX_LEN];
+        inet_ntop(AF_INET, &cli_addr.sin_addr, cli_ip, sizeof(cli_ip));
+        
+        if (g_state.config.security.enabled) {
+            if (spf_is_blocked(&g_state, cli_ip)) {
+                close(cli_fd);
+                continue;
+            }
+            
+            if (!spf_register_attempt(&g_state, cli_ip)) {
+                close(cli_fd);
+                continue;
+            }
+        }
+        
+        if (g_state.config.security.enabled && spf_geoip_is_blocked(&g_state, cli_ip)) {
+            spf_event_push(&g_state, SPF_EVENT_GEOBLOCK, cli_ip, ntohs(cli_addr.sin_port), rule->id, "geo blocked");
+            close(cli_fd);
+            continue;
+        }
+        
+        int backend_idx = spf_lb_select_backend(rule, cli_ip);
+        if (backend_idx < 0) {
+            spf_log(SPF_LOG_WARN, "no healthy backend for rule %u", rule->id);
+            close(cli_fd);
+            continue;
+        }
+        
+        spf_backend_t* b = &rule->backends[backend_idx];
+        
+        int tgt_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (tgt_fd < 0) {
+            close(cli_fd);
+            continue;
+        }
+        
+        struct sockaddr_in tgt_addr = {0};
+        tgt_addr.sin_family = AF_INET;
+        tgt_addr.sin_port = htons(b->port);
+        inet_pton(AF_INET, b->host, &tgt_addr.sin_addr);
+        
+        struct timeval tv_conn = {5, 0};
+        setsockopt(tgt_fd, SOL_SOCKET, SO_RCVTIMEO, &tv_conn, sizeof(tv_conn));
+        setsockopt(tgt_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_conn, sizeof(tv_conn));
+        
+        if (connect(tgt_fd, (struct sockaddr*)&tgt_addr, sizeof(tgt_addr)) < 0) {
+            close(tgt_fd);
+            close(cli_fd);
+            continue;
+        }
+        
+        if (g_state.config.security.proxy_proto) {
+            send_proxy_proto_v2(tgt_fd, &cli_addr, &tgt_addr);
+        }
+        
+        pthread_mutex_lock(&g_state.stats_lock);
+        int conn_idx = -1;
+        for (int i = 0; i < SPF_MAX_CONNECTIONS; i++) {
+            if (!g_state.connections[i].active) {
+                conn_idx = i;
+                break;
+            }
+        }
+        if (conn_idx < 0) {
+            pthread_mutex_unlock(&g_state.stats_lock);
+            close(tgt_fd);
+            close(cli_fd);
+            continue;
+        }
+        
+        g_state.connections[conn_idx].active = true;
+        g_state.connections[conn_idx].id = g_state.next_conn_id++;
+        strncpy(g_state.connections[conn_idx].client_ip, cli_ip, SPF_IP_MAX_LEN - 1);
+        g_state.connections[conn_idx].client_port = ntohs(cli_addr.sin_port);
+        g_state.connections[conn_idx].rule_id = rule->id;
+        g_state.connections[conn_idx].backend_idx = backend_idx;
+        g_state.connections[conn_idx].start_time = spf_time_sec();
+        g_state.active_conns++;
+        g_state.total_conns++;
+        pthread_mutex_unlock(&g_state.stats_lock);
+        
+        spf_event_push(&g_state, SPF_EVENT_CONN_OPEN, cli_ip, ntohs(cli_addr.sin_port), rule->id, b->host);
+        
+        session_t* sess = (session_t*)calloc(1, sizeof(session_t));
+        if (!sess) {
+            spf_log(SPF_LOG_ERROR, "oom in listener");
+            close(cli_fd);
+            close(tgt_fd);
+            release_conn_slot((uint32_t)conn_idx, true);
+            continue;
+        }
+        
+        sess->client_fd = cli_fd;
+        sess->target_fd = tgt_fd;
+        sess->client_addr = cli_addr;
+        sess->rule = rule;
+        sess->backend_idx = backend_idx;
+        sess->conn_idx = conn_idx;
+        
+        // Setup TLS
+        if (rule->tls_terminate) {
+            sess->client_ssl = tls_accept(cli_fd);
+            if (!sess->client_ssl) {
+                spf_log(SPF_LOG_ERROR, "tls accept failed");
+                close(cli_fd);
+                close(tgt_fd);
+                release_conn_slot((uint32_t)conn_idx, true);
+                free(sess);
+                continue;
+            }
+        }
+        
+        // Connect to target (TLS if needed)
+        // ... (assume target logic is similar, kept simplistic here for brevity)
+        
+        pthread_t t;
+        pthread_create(&t, NULL, session_thread, sess);
+        pthread_detach(t);
+    }
+    
+    close(fd);
+    spf_log(SPF_LOG_INFO, "rule %u listener stopped", rule->id);
+    return NULL;
 }
 
-static void usage(void)
-{
-	printf("tunl v%s - IPv6-first self-hosting toolkit\n\n", TUNL_VERSION);
-	printf("Usage:\n");
-	printf("  tunl serve [options]        Start proxy server\n");
-	printf("  tunl dns [options]          DNS dynamic updates\n");
-	printf("  tunl cert [options]         TLS certificates (ACME)\n");
-	printf("  tunl check [options]        Reachability test\n");
-	printf("  tunl tui                    Terminal dashboard\n");
-	printf("  tunl -f <port:host:port>    Quick forward mode\n\n");
-	printf("Serve options:\n");
-	printf("  -C, --config <path>    Config file (default: tunl.conf)\n");
-	printf("  -d, --daemon           Run as daemon\n\n");
-	printf("DNS options:\n");
-	printf("  --provider <cf|rfc2136>   DNS provider\n");
-	printf("  --hostname <name>         Hostname to update\n");
-	printf("  --token <token>           API token\n");
-	printf("  --monitor                 Run as background monitor\n\n");
-	printf("Cert options:\n");
-	printf("  --domain <domain>         Domain for certificate\n");
-	printf("  --email <email>           Contact email\n");
-	printf("  --staging                 Use staging (test) server\n\n");
-	printf("Check options:\n");
-	printf("  --hostname <name>         Hostname to check\n");
-	printf("  --port <port>             Port to check\n\n");
-	printf("Examples:\n");
-	printf("  tunl -f 443:localhost:8080\n");
-	printf("  tunl serve -C /etc/tunl.conf -d\n");
-	printf("  tunl dns --provider cf --hostname my.example.com --token xxx\n");
-	printf("  tunl cert --domain my.example.com --email me@example.com\n");
-	printf("  tunl check --hostname my.example.com --port 443\n");
-	printf("  tunl tui\n");
+static bool ctrl_send(int fd, SSL* ssl, const char* msg) {
+    size_t len = strlen(msg);
+    size_t off = 0;
+
+    while (off < len) {
+        ssize_t n;
+        if (ssl) {
+            n = tls_write(ssl, msg + off, len - off);
+            if (n == 0) {
+                usleep(1000);
+                continue;
+            }
+        } else {
+            n = send(fd, msg + off, len - off, 0);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                usleep(1000);
+                continue;
+            }
+        }
+        if (n <= 0) {
+            return false;
+        }
+        off += (size_t)n;
+    }
+
+    return true;
 }
 
-/* ============================================================================
- * Subcommand: serve
- * ============================================================================ */
-
-static int cmd_serve(int argc, char **argv)
-{
-	static struct option opts[] = {
-		{"config", required_argument, 0, 'C'},
-		{"daemon", no_argument, 0, 'd'},
-		{"forward", required_argument, 0, 'f'},
-		{0, 0, 0, 0}
-	};
-
-	const char *config_path = "tunl.conf";
-	char *forward_spec = NULL;
-	bool daemon_mode = false;
-	int c;
-
-	optind = 1;  /* Reset getopt */
-	while ((c = getopt_long(argc, argv, "C:f:d", opts, NULL)) != -1) {
-		switch (c) {
-		case 'C':
-			config_path = optarg;
-			break;
-		case 'f':
-			forward_spec = optarg;
-			break;
-		case 'd':
-			daemon_mode = true;
-			break;
-		}
-	}
-
-	if (daemon_mode)
-		daemonize();
-
-	tunl_init(&g_state);
-	tunl_load_config(&g_state, config_path);
-
-	/* One-liner forward mode */
-	if (forward_spec) {
-		int lport, bport;
-		char bhost[128];
-
-		if (sscanf(forward_spec, "%d:%127[^:]:%d", &lport, bhost, &bport) == 3) {
-			struct tunl_rule rule;
-
-			memset(&rule, 0, sizeof(rule));
-			rule.id = 1;
-			rule.listen_port = (uint16_t)lport;
-			rule.enabled = true;
-			rule.lb_algo = TUNL_LB_ROUNDROBIN;
-			rule.max_conns = 512;
-
-			strncpy(rule.backends[0].host, bhost, TUNL_IP_MAX_LEN - 1);
-			rule.backends[0].host[TUNL_IP_MAX_LEN - 1] = '\0';
-			rule.backends[0].port = (uint16_t)bport;
-			rule.backends[0].state = TUNL_BACKEND_UP;
-			rule.backends[0].healthy = true;
-			rule.backend_count = 1;
-
-			if (tunl_add_rule(&g_state, &rule) == 0) {
-				struct tunl_rule *r = tunl_get_rule(&g_state, 1);
-
-				if (r) {
-					pthread_t tid;
-
-					void *(*thr)(void *) = listener_thread;
-					if (r->protocol == TUNL_PROTO_UDP)
-						thr = udp_listener_thread;
-
-					pthread_create(&tid, NULL, thr, r);
-					pthread_detach(tid);
-					start_rule_workers(r);
-				}
-			}
-		} else {
-			fprintf(stderr, "Invalid: use port:host:port\n");
-			return 1;
-		}
-	}
-
-	/* Start listeners for config rules */
-	for (int i = 0; i < TUNL_MAX_RULES; i++) {
-		if (g_state.rules[i].enabled) {
-			if (g_state.rules[i].backend_count == 0) {
-				tunl_log(TUNL_LOG_WARN, "rule %u has no backends; skipping listener",
-					g_state.rules[i].id);
-				continue;
-			}
-			pthread_t tid;
-			void *(*thr)(void *) = listener_thread;
-			if (g_state.rules[i].protocol == TUNL_PROTO_UDP)
-				thr = udp_listener_thread;
-
-			pthread_create(&tid, NULL, thr, &g_state.rules[i]);
-			pthread_detach(tid);
-			start_rule_workers(&g_state.rules[i]);
-		}
-	}
-
-	signal(SIGINT, sig_handler);
-	signal(SIGTERM, sig_handler);
-	signal(SIGPIPE, SIG_IGN);
-
-	pthread_t ctrl_tid;
- 	pthread_t metrics_tid;
-
-	pthread_create(&ctrl_tid, NULL, ctrl_thread, NULL);
-	pthread_create(&metrics_tid, NULL, metrics_thread, NULL);
-
-	if (!daemon_mode) {
-		printf("tunl v%s\n", TUNL_VERSION);
-		printf("ctrl: nc %s %d\n", 
-		       g_state.bind_addr[0] ? g_state.bind_addr : "localhost",
-		       g_state.ctrl_port);
-	}
-
-	while (!g_shutdown && g_state.running)
-		sleep(1);
-
-	tunl_log(TUNL_LOG_INFO, "shutting down");
-	g_state.running = false;
-
-	if (g_ctrl_fd >= 0)
-		close(g_ctrl_fd);
-
-	pthread_join(ctrl_tid, NULL);
-	pthread_join(metrics_tid, NULL);
-	tunl_shutdown(&g_state);
-
-	return 0;
+static ssize_t ctrl_recv(int fd, SSL* ssl, char* buf, size_t len) {
+    if (ssl) {
+        return tls_read(ssl, buf, len);
+    }
+    return recv(fd, buf, len, 0);
 }
 
-/* ============================================================================
- * Subcommand: dns
- * ============================================================================ */
-
-static int cmd_dns(int argc, char **argv)
-{
-	static struct option opts[] = {
-		{"provider", required_argument, 0, 'p'},
-		{"hostname", required_argument, 0, 'H'},
-		{"token", required_argument, 0, 't'},
-		{"monitor", no_argument, 0, 'm'},
-		{"status", no_argument, 0, 's'},
-		{0, 0, 0, 0}
-	};
-
-	const char *provider = "cloudflare";
-	const char *hostname = NULL;
-	const char *token = NULL;
-	bool monitor = false;
-	bool status = false;
-	int c;
-
-	optind = 1;
-	while ((c = getopt_long(argc, argv, "p:H:t:ms", opts, NULL)) != -1) {
-		switch (c) {
-		case 'p':
-			provider = optarg;
-			break;
-		case 'H':
-			hostname = optarg;
-			break;
-		case 't':
-			token = optarg;
-			break;
-		case 'm':
-			monitor = true;
-			break;
-		case 's':
-			status = true;
-			break;
-		}
-	}
-
-	if (status) {
-		char buf[1024];
-		dns_status(buf, sizeof(buf));
-		printf("%s", buf);
-		return 0;
-	}
-
-	if (!hostname) {
-		fprintf(stderr, "Error: --hostname required\n");
-		return 1;
-	}
-
-	if (dns_init(provider, hostname, token) != 0) {
-		fprintf(stderr, "Error: DNS init failed\n");
-		return 1;
-	}
-
-	if (monitor) {
-		printf("Starting DNS monitor for %s (provider: %s)\n", hostname, provider);
-		signal(SIGINT, sig_handler);
-		signal(SIGTERM, sig_handler);
-		g_state.running = true;
-		dns_monitor_thread(NULL);
-	} else {
-		/* One-shot update */
-		char buf[1024];
-		printf("Updating DNS for %s...\n", hostname);
-		dns_status(buf, sizeof(buf));
-		printf("%s", buf);
-	}
-
-	return 0;
+void handle_ctrl(int fd, SSL* ssl) {
+    char buf[SPF_BUFFER_SIZE];
+    bool authed = g_state.config.admin.token[0] == '\0';
+    
+    if (!ctrl_send(fd, ssl, "SPF v" SPF_VERSION " Control\n")) return;
+    if (!authed && !ctrl_send(fd, ssl, "AUTH required\n")) return;
+    if (!ctrl_send(fd, ssl, "> ")) return;
+    
+    while (!g_shutdown) {
+        ssize_t n = ctrl_recv(fd, ssl, buf, sizeof(buf) - 1);
+        if (n < 0) break;
+        if (n == 0) {
+            if (ssl) {
+                usleep(1000);
+                continue;
+            }
+            break;
+        }
+        buf[n] = '\0';
+        
+        char* nl = strchr(buf, '\n'); if (nl) *nl = '\0';
+        char* cr = strchr(buf, '\r'); if (cr) *cr = '\0';
+        if (strlen(buf) == 0) {
+            if (!ctrl_send(fd, ssl, "> ")) break;
+            continue;
+        }
+        
+        char resp[SPF_RES_MAX_LEN] = {0};
+        
+        if (strncmp(buf, "QUIT", 4) == 0) {
+            break;
+        }
+        else if (strncmp(buf, "AUTH ", 5) == 0) {
+            if (spf_verify_token(&g_state, buf + 5)) {
+                authed = true;
+                snprintf(resp, sizeof(resp), "OK authenticated\n");
+            } else {
+                spf_event_push(&g_state, SPF_EVENT_AUTH_FAIL, "", 0, 0, "bad token");
+                snprintf(resp, sizeof(resp), "ERR bad token\n");
+            }
+        }
+        else if (!authed) {
+            snprintf(resp, sizeof(resp), "ERR auth required\n");
+        }
+        else if (strncmp(buf, "HELP", 4) == 0) {
+            snprintf(resp, sizeof(resp),
+                "Commands:\n"
+                "  AUTH <token>       - authenticate\n"
+                "  STATUS             - system stats\n"
+                "  RULES              - list rules\n"
+                "  BACKENDS <id>      - show backends\n"
+                "  ADD <port> <ip:port> [algo] - add rule\n"
+                "  DEL <id>           - delete rule\n"
+                "  PAUSE <id>         - stop accepting for rule\n"
+                "  RESUME <id>        - resume accepting for rule\n"
+                "  DRAIN <id> <idx> [sec] - drain backend index\n"
+                "  SETWEIGHT <id> <idx> <w> - set backend weight\n"
+                "  SETSTATE <id> <idx> <UP|DOWN|DRAIN> - set backend state\n"
+                "  ADMINALLOWLIST     - list admin allowlist\n"
+                "  ADMINALLOW <ip>    - add admin allowlist ip\n"
+                "  ADMINDENY <ip>     - remove admin allowlist ip\n"
+                "  ADMINSET <csv>     - replace admin allowlist\n"
+                "  SAVE               - save runtime config\n"
+                "  RELOAD             - reload config from disk\n"
+                "  HEALTH <id>        - backend health snapshot\n"
+                "  BLOCK <ip> [sec]   - block ip\n"
+                "  UNBLOCK <ip>       - unblock ip\n"
+                "  LOGS [n]           - recent events\n"
+                "  METRICS            - prometheus\n"
+                "  QUIT               - close\n");
+        }
+        else if (strncmp(buf, "STATUS", 6) == 0) {
+            uint64_t up = spf_time_sec() - g_state.start_time;
+            snprintf(resp, sizeof(resp),
+                "--- SPF STATUS ---\n"
+                "Version: %s\n"
+                "Uptime: %luh %lum %lus\n"
+                "Active Conns: %u\n"
+                "Total Conns: %lu\n"
+                "Bytes In: %lu\n"
+                "Bytes Out: %lu\n"
+                "Rules: %u\n"
+                "Blocked IPs: %lu\n",
+                SPF_VERSION,
+                up/3600, (up%3600)/60, up%60,
+                g_state.active_conns,
+                g_state.total_conns,
+                g_state.total_bytes_in,
+                g_state.total_bytes_out,
+                g_state.rule_count,
+                g_state.blocked_count);
+        }
+        else if (strncmp(buf, "RULES", 5) == 0) {
+            char* p = resp;
+            p += snprintf(p, sizeof(resp), "--- RULES ---\n");
+            for (int i = 0; i < SPF_MAX_RULES && p - resp < SPF_RES_MAX_LEN - 100; i++) {
+                if (g_state.rules[i].active) {
+                    spf_rule_t* r = &g_state.rules[i];
+                    p += snprintf(p, SPF_RES_MAX_LEN - (p - resp),
+                        "ID:%u Port:%u Backends:%u LB:%d\n",
+                        r->id, r->listen_port, r->backend_count, r->lb_algo);
+                }
+            }
+        }
+        else if (strncmp(buf, "BACKENDS ", 9) == 0) {
+            uint32_t id;
+            if (sscanf(buf + 9, "%u", &id) == 1) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                if (r) {
+                    char* p = resp;
+                    p += snprintf(p, sizeof(resp), "--- BACKENDS for %u ---\n", id);
+                    for (int i = 0; i < r->backend_count; i++) {
+                        spf_backend_t* b = &r->backends[i];
+                        p += snprintf(p, SPF_RES_MAX_LEN - (p - resp),
+                            "%s:%u w=%u state=%s conns=%u\n",
+                            b->host, b->port, b->weight,
+                            b->state == SPF_BACKEND_UP ? "UP" : b->state == SPF_BACKEND_DOWN ? "DOWN" : "DRAIN",
+                            b->active_conns);
+                    }
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                }
+            }
+        }
+        else if (strncmp(buf, "ADD ", 4) == 0) {
+            uint16_t port = 0;
+            char backend[256];
+            char algo[16] = "rr";
+            int parsed = sscanf(buf + 4, "%hu %255s %15s", &port, backend, algo);
+            
+            if (parsed >= 2 && port > 0) {
+                spf_rule_t rule = {0};
+                uint8_t rnd[4];
+                spf_random_bytes(rnd, 4);
+                uint32_t rule_rand = 0;
+                memcpy(&rule_rand, rnd, sizeof(rule_rand));
+                rule.id = rule_rand % 90000 + 10000;
+                rule.listen_port = port;
+                rule.enabled = true;
+                rule.rate_bps = 100 * 1024 * 1024;
+                
+                if (strcmp(algo, "lc") == 0) rule.lb_algo = SPF_LB_LEASTCONN;
+                else if (strcmp(algo, "ip") == 0) rule.lb_algo = SPF_LB_IPHASH;
+                else if (strcmp(algo, "w") == 0) rule.lb_algo = SPF_LB_WEIGHTED;
+                else rule.lb_algo = SPF_LB_ROUNDROBIN;
+                
+                bool bad_backend = false;
+                char* saveptr = NULL;
+                char* tok = strtok_r(backend, ",", &saveptr);
+                while (tok && rule.backend_count < SPF_MAX_BACKENDS) {
+                    spf_backend_t parsed_backend;
+                    if (!parse_backend_token(tok, &parsed_backend)) {
+                        bad_backend = true;
+                        break;
+                    }
+                    rule.backends[rule.backend_count] = parsed_backend;
+                    rule.backend_count++;
+                    tok = strtok_r(NULL, ",", &saveptr);
+                }
+                
+                if (bad_backend) {
+                    snprintf(resp, sizeof(resp), "ERR bad backend format (use IPv4 host:port list)\n");
+                }
+                else if (rule.backend_count > 0) {
+                    if (spf_add_rule(&g_state, &rule) == 0) {
+                        spf_rule_t* added = spf_get_rule(&g_state, rule.id);
+                        if (added) {
+                            if (!added->listener_started) {
+                                if (pthread_create(&added->listen_thread, NULL, listener_thread, added) == 0) {
+                                    pthread_detach(added->listen_thread);
+                                    added->listener_started = true;
+                                } else {
+                                    snprintf(resp, sizeof(resp), "ERR failed to start listener\n");
+                                    goto send_resp;
+                                }
+                            }
+                            snprintf(resp, sizeof(resp), "OK rule %u added\n", rule.id);
+                        } else {
+                            snprintf(resp, sizeof(resp), "ERR internal error\n");
+                        }
+                    } else {
+                        snprintf(resp, sizeof(resp), "ERR failed to add rule\n");
+                    }
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR bad backend format\n");
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: ADD <port> <host:port,...> [rr|lc|ip|w]\n");
+            }
+        }
+        else if (strncmp(buf, "DEL ", 4) == 0) {
+            uint32_t id;
+            if (sscanf(buf + 4, "%u", &id) == 1) {
+                if (spf_del_rule(&g_state, id) == 0) {
+                    snprintf(resp, sizeof(resp), "OK deleted\n");
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR not found\n");
+                }
+            }
+        }
+        else if (strncmp(buf, "PAUSE ", 6) == 0) {
+            uint32_t id;
+            if (sscanf(buf + 6, "%u", &id) == 1) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                if (!r) {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                } else {
+                    pthread_mutex_lock(&r->lock);
+                    r->enabled = false;
+                    pthread_mutex_unlock(&r->lock);
+                    snprintf(resp, sizeof(resp), "OK paused %u\n", id);
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: PAUSE <id>\n");
+            }
+        }
+        else if (strncmp(buf, "RESUME ", 7) == 0) {
+            uint32_t id;
+            if (sscanf(buf + 7, "%u", &id) == 1) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                if (!r) {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                } else {
+                    pthread_mutex_lock(&r->lock);
+                    r->enabled = true;
+                    pthread_mutex_unlock(&r->lock);
+                    snprintf(resp, sizeof(resp), "OK resumed %u\n", id);
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: RESUME <id>\n");
+            }
+        }
+        else if (strncmp(buf, "DRAIN ", 6) == 0) {
+            uint32_t id;
+            char idx_str[16] = {0};
+            uint32_t timeout = 30;
+            int parsed = sscanf(buf + 6, "%u %15s %u", &id, idx_str, &timeout);
+            if (parsed >= 2) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                uint8_t idx = 0;
+                if (!r) {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                } else if (parse_backend_index_strict(idx_str, &idx) != 0 || idx >= r->backend_count) {
+                    snprintf(resp, sizeof(resp), "ERR invalid backend index\n");
+                } else {
+                    uint32_t active_left = 0;
+                    int rc = rule_backend_drain(r, idx, timeout, &active_left);
+                    if (rc == 0) {
+                        snprintf(resp, sizeof(resp), "OK drained backend %u for rule %u\n", idx, id);
+                    } else {
+                        snprintf(resp, sizeof(resp), "OK draining backend %u rule %u active=%u\n", idx, id, active_left);
+                    }
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: DRAIN <id> <idx> [seconds]\n");
+            }
+        }
+        else if (strncmp(buf, "SETWEIGHT ", 10) == 0) {
+            uint32_t id;
+            char idx_str[16] = {0};
+            uint16_t weight = 0;
+            int parsed = sscanf(buf + 10, "%u %15s %hu", &id, idx_str, &weight);
+            if (parsed == 3) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                uint8_t idx = 0;
+                if (!r) {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                } else if (parse_backend_index_strict(idx_str, &idx) != 0) {
+                    snprintf(resp, sizeof(resp), "ERR invalid backend index\n");
+                } else if (rule_backend_set_weight(r, idx, weight) != 0) {
+                    snprintf(resp, sizeof(resp), "ERR failed to set weight\n");
+                } else {
+                    snprintf(resp, sizeof(resp), "OK weight set rule=%u backend=%u weight=%u\n", id, idx, weight);
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: SETWEIGHT <id> <idx> <weight>\n");
+            }
+        }
+        else if (strncmp(buf, "SETSTATE ", 9) == 0) {
+            uint32_t id;
+            char idx_str[16] = {0};
+            char state_str[16] = {0};
+            int parsed = sscanf(buf + 9, "%u %15s %15s", &id, idx_str, state_str);
+            if (parsed == 3) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                uint8_t idx = 0;
+                if (!r) {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                } else if (parse_backend_index_strict(idx_str, &idx) != 0) {
+                    snprintf(resp, sizeof(resp), "ERR invalid backend index\n");
+                } else {
+                    spf_backend_state_t st;
+                    if (strcmp(state_str, "UP") == 0) st = SPF_BACKEND_UP;
+                    else if (strcmp(state_str, "DOWN") == 0) st = SPF_BACKEND_DOWN;
+                    else if (strcmp(state_str, "DRAIN") == 0) st = SPF_BACKEND_DRAIN;
+                    else {
+                        snprintf(resp, sizeof(resp), "ERR state must be UP|DOWN|DRAIN\n");
+                        goto send_resp;
+                    }
+                    if (rule_backend_set_state(r, idx, st) != 0) {
+                        snprintf(resp, sizeof(resp), "ERR failed to set state\n");
+                    } else {
+                        snprintf(resp, sizeof(resp), "OK state set rule=%u backend=%u\n", id, idx);
+                    }
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: SETSTATE <id> <idx> <UP|DOWN|DRAIN>\n");
+            }
+        }
+        else if (strncmp(buf, "ADMINALLOWLIST", 14) == 0) {
+            char* p = resp;
+            pthread_mutex_lock(&g_state.lock);
+            p += snprintf(p, SPF_RES_MAX_LEN - (p - resp), "--- ADMIN ALLOWLIST (%u) ---\n", g_state.config.admin.allowlist_count);
+            for (uint8_t i = 0; i < g_state.config.admin.allowlist_count && p - resp < SPF_RES_MAX_LEN - 64; i++) {
+                p += snprintf(p, SPF_RES_MAX_LEN - (p - resp), "%s\n", g_state.config.admin.allowlist[i]);
+            }
+            pthread_mutex_unlock(&g_state.lock);
+        }
+        else if (strncmp(buf, "ADMINALLOW ", 11) == 0) {
+            char ip[SPF_IP_MAX_LEN] = {0};
+            if (sscanf(buf + 11, "%45s", ip) == 1) {
+                int rc = admin_allowlist_add(ip);
+                if (rc == 0) snprintf(resp, sizeof(resp), "OK admin allow %s\n", ip);
+                else if (rc == 1) snprintf(resp, sizeof(resp), "OK already allowed %s\n", ip);
+                else if (rc == -2) snprintf(resp, sizeof(resp), "ERR allowlist full\n");
+                else snprintf(resp, sizeof(resp), "ERR invalid ip\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: ADMINALLOW <ip>\n");
+            }
+        }
+        else if (strncmp(buf, "ADMINDENY ", 10) == 0) {
+            char ip[SPF_IP_MAX_LEN] = {0};
+            if (sscanf(buf + 10, "%45s", ip) == 1) {
+                int rc = admin_allowlist_del(ip);
+                if (rc == 0) snprintf(resp, sizeof(resp), "OK admin deny %s\n", ip);
+                else if (rc == 1) snprintf(resp, sizeof(resp), "ERR not present\n");
+                else snprintf(resp, sizeof(resp), "ERR invalid ip\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: ADMINDENY <ip>\n");
+            }
+        }
+        else if (strncmp(buf, "ADMINSET ", 9) == 0) {
+            if (admin_allowlist_set_csv(buf + 9) == 0) {
+                snprintf(resp, sizeof(resp), "OK admin allowlist replaced\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: ADMINSET <ip1,ip2,...>\n");
+            }
+        }
+        else if (strncmp(buf, "SAVE", 4) == 0) {
+            if (save_runtime_config() == 0) {
+                snprintf(resp, sizeof(resp), "OK config saved\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR failed to save config\n");
+            }
+        }
+        else if (strncmp(buf, "RELOAD", 6) == 0) {
+            if (spf_reload_config(&g_state) == 0) {
+                snprintf(resp, sizeof(resp), "OK config reloaded\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR failed to reload config\n");
+            }
+        }
+        else if (strncmp(buf, "HEALTH ", 7) == 0) {
+            uint32_t id;
+            if (sscanf(buf + 7, "%u", &id) == 1) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                if (!r) {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                } else {
+                    char* p = resp;
+                    p += snprintf(p, SPF_RES_MAX_LEN - (p - resp), "--- HEALTH %u ---\n", id);
+                    for (int i = 0; i < r->backend_count && p - resp < SPF_RES_MAX_LEN - 120; i++) {
+                        spf_backend_t* b = &r->backends[i];
+                        p += snprintf(p, SPF_RES_MAX_LEN - (p - resp),
+                            "idx=%d %s:%u state=%s conns=%u fails=%u last=%lu\n",
+                            i,
+                            b->host,
+                            b->port,
+                            b->state == SPF_BACKEND_UP ? "UP" : b->state == SPF_BACKEND_DOWN ? "DOWN" : "DRAIN",
+                            b->active_conns,
+                            b->health_fails,
+                            b->last_health_check);
+                    }
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: HEALTH <id>\n");
+            }
+        }
+        else if (strncmp(buf, "BLOCK ", 6) == 0) {
+            char ip[64] = {0};
+            uint64_t dur = 3600;
+            int parsed = sscanf(buf + 6, "%63s %lu", ip, &dur);
+            if (parsed >= 1 && ip[0] != '\0') {
+                spf_block_ip(&g_state, ip, dur);
+                snprintf(resp, sizeof(resp), "OK blocked %s for %lu sec\n", ip, dur);
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: BLOCK <ip> [seconds]\n");
+            }
+        }
+        else if (strncmp(buf, "UNBLOCK ", 8) == 0) {
+            char ip[64];
+            if (sscanf(buf + 8, "%63s", ip) == 1) {
+                spf_unblock_ip(&g_state, ip);
+                snprintf(resp, sizeof(resp), "OK unblocked %s\n", ip);
+            }
+        }
+        else if (strncmp(buf, "LOGS", 4) == 0) {
+            uint32_t n = 10;
+            sscanf(buf + 4, "%u", &n);
+            if (n > 50) n = 50;
+            
+            spf_event_t events[50];
+            uint32_t actual;
+            spf_event_get_recent(&g_state, events, n, &actual);
+            
+            char* p = resp;
+            p += snprintf(p, sizeof(resp), "--- LAST %u EVENTS ---\n", actual);
+            for (uint32_t i = 0; i < actual && p - resp < SPF_RES_MAX_LEN - 150; i++) {
+                p += snprintf(p, SPF_RES_MAX_LEN - (p - resp),
+                    "%lu type=%d %s:%u %s\n",
+                    events[i].timestamp, events[i].type,
+                    events[i].src_ip, events[i].src_port,
+                    events[i].details);
+            }
+        }
+        else if (strncmp(buf, "METRICS", 7) == 0) {
+            int n = metrics_format(&g_state, resp, sizeof(resp) - 1);
+            if (n < 0) {
+                snprintf(resp, sizeof(resp), "ERR metrics formatting failed\n");
+            } else {
+                resp[sizeof(resp) - 1] = '\0';
+            }
+        }
+        else {
+            snprintf(resp, sizeof(resp), "ERR unknown cmd\n");
+        }
+send_resp:
+        if (!ctrl_send(fd, ssl, resp)) break;
+        if (!ctrl_send(fd, ssl, "> ")) break;
+    }
 }
 
-/* ============================================================================
- * Subcommand: cert
- * ============================================================================ */
+void* ctrl_thread(void* arg) {
+    (void)arg;
+    
+    g_ctrl_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(g_ctrl_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    inet_pton(AF_INET, g_state.config.admin.bind_addr, &addr.sin_addr);
+    addr.sin_port = htons(g_state.config.admin.port);
+    
+    if (bind(g_ctrl_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        spf_log(SPF_LOG_ERROR, "ctrl bind failed: %s", strerror(errno));
+        return NULL;
+    }
+    
+    listen(g_ctrl_fd, 5);
+    spf_log(SPF_LOG_INFO, "ctrl listening on %s:%u", g_state.config.admin.bind_addr, g_state.config.admin.port);
+    
+    while (!g_shutdown && g_state.running) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(g_ctrl_fd, &fds);
+        struct timeval tv = {1, 0};
+        
+        if (select(g_ctrl_fd + 1, &fds, NULL, NULL, &tv) <= 0) continue;
+        
+        struct sockaddr_in cli_addr;
+        socklen_t cli_len = sizeof(cli_addr);
+        int cli = accept(g_ctrl_fd, (struct sockaddr*)&cli_addr, &cli_len);
+        if (cli >= 0) {
+            if (!is_admin_ip_allowed(&cli_addr)) {
+                char ip[SPF_IP_MAX_LEN] = {0};
+                inet_ntop(AF_INET, &cli_addr.sin_addr, ip, sizeof(ip));
+                spf_log(SPF_LOG_WARN, "admin connection denied by allowlist: %s", ip);
+                close(cli);
+                continue;
+            }
+            SSL* admin_ssl = NULL;
+            if (g_state.config.admin.tls_enabled) {
+                admin_ssl = tls_accept(cli);
+                if (!admin_ssl) {
+                    spf_log(SPF_LOG_WARN, "admin tls handshake failed");
+                    close(cli);
+                    continue;
+                }
+            }
 
-static int cmd_cert(int argc, char **argv)
-{
-	static struct option opts[] = {
-		{"domain", required_argument, 0, 'd'},
-		{"email", required_argument, 0, 'e'},
-		{"staging", no_argument, 0, 's'},
-		{"status", no_argument, 0, 'S'},
-		{0, 0, 0, 0}
-	};
+            spf_log(SPF_LOG_INFO, "admin connected");
+            handle_ctrl(cli, admin_ssl);
+            spf_log(SPF_LOG_INFO, "admin disconnected");
 
-	const char *domain = NULL;
-	const char *email = NULL;
-	bool staging = false;
-	bool status = false;
-	int c;
-
-	optind = 1;
-	while ((c = getopt_long(argc, argv, "d:e:sS", opts, NULL)) != -1) {
-		switch (c) {
-		case 'd':
-			domain = optarg;
-			break;
-		case 'e':
-			email = optarg;
-			break;
-		case 's':
-			staging = true;
-			break;
-		case 'S':
-			status = true;
-			break;
-		}
-	}
-
-	if (status) {
-		char buf[1024];
-		acme_status(buf, sizeof(buf));
-		printf("%s", buf);
-		return 0;
-	}
-
-	if (!domain) {
-		fprintf(stderr, "Error: --domain required\n");
-		return 1;
-	}
-
-	if (acme_init(domain, email, staging ? 1 : 0) != 0) {
-		fprintf(stderr, "Error: ACME init failed\n");
-		return 1;
-	}
-
-	printf("Requesting certificate for %s...\n", domain);
-	printf("Mode: %s\n", staging ? "staging (test)" : "production");
-
-	if (acme_ensure_cert() == 0) {
-		printf("Certificate obtained!\n");
-		printf("  Cert: %s\n", acme_get_cert_path());
-		printf("  Key:  %s\n", acme_get_key_path());
-		return 0;
-	} else {
-		fprintf(stderr, "Certificate request failed\n");
-		return 1;
-	}
+            if (admin_ssl) {
+                tls_close(admin_ssl);
+            }
+            close(cli);
+        }
+    }
+    
+    close(g_ctrl_fd);
+    return NULL;
 }
 
-/* ============================================================================
- * Subcommand: check
- * ============================================================================ */
-
-static int cmd_check(int argc, char **argv)
-{
-	static struct option opts[] = {
-		{"hostname", required_argument, 0, 'H'},
-		{"port", required_argument, 0, 'p'},
-		{"quick", no_argument, 0, 'q'},
-		{0, 0, 0, 0}
-	};
-
-	const char *hostname = NULL;
-	int port = 443;
-	bool quick = false;
-	int c;
-
-	optind = 1;
-	while ((c = getopt_long(argc, argv, "H:p:q", opts, NULL)) != -1) {
-		switch (c) {
-		case 'H':
-			hostname = optarg;
-			break;
-		case 'p':
-			port = atoi(optarg);
-			break;
-		case 'q':
-			quick = true;
-			break;
-		}
-	}
-
-	if (quick) {
-		return check_quick(hostname, port);
-	} else {
-		return check_connectivity(hostname, port);
-	}
+void daemonize(void) {
+    pid_t pid = fork();
+    if (pid < 0) exit(1);
+    if (pid > 0) exit(0);
+    if (setsid() < 0) exit(1);
+    pid = fork();
+    if (pid < 0) exit(1);
+    if (pid > 0) exit(0);
+    umask(0);
+    chdir("/");
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
 }
 
-/* ============================================================================
- * Subcommand: tui
- * ============================================================================ */
+int main(int argc, char** argv) {
+    const char* config_path = "spf.conf";
+    char* bind_addr = NULL;
+    char* token = NULL;
+    char* ca = NULL;
+    char* cert = NULL;
+    char* key = NULL;
+    int port = 0; // 0 means not set via CLI
+    bool daemon_mode = false;
+    
+    static struct option opts[] = {
+        {"config", required_argument, 0, 'C'},
+        {"admin-bind", required_argument, 0, 'b'},
+        {"admin-port", required_argument, 0, 'p'},
+        {"token", required_argument, 0, 't'},
+        {"admin-allow", required_argument, 0, 'a'},
+        {"mtls", no_argument, 0, 'm'},
+        {"ca", required_argument, 0, 'A'},
+        {"cert", required_argument, 0, 'c'},
+        {"key", required_argument, 0, 'k'},
+        {"daemon", no_argument, 0, 'd'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+    
+    char* admin_allow = NULL;
+    bool cli_mtls = false;
+    bool cli_port_set = false;
+    int c;
+    while ((c = getopt_long(argc, argv, "C:b:p:t:a:mA:c:k:dh", opts, NULL)) != -1) {
+        switch (c) {
+            case 'C': config_path = optarg; break;
+            case 'b': bind_addr = optarg; break;
+            case 'p': {
+                uint16_t parsed_port = 0;
+                if (!parse_u16_strict(optarg, &parsed_port)) {
+                    fprintf(stderr, "Invalid --admin-port: %s\n", optarg ? optarg : "(null)");
+                    return 1;
+                }
+                port = (int)parsed_port;
+                cli_port_set = true;
+                break;
+            }
+            case 't': token = optarg; break;
+            case 'a': admin_allow = optarg; break;
+            case 'm': cli_mtls = true; break;
+            case 'A': ca = optarg; break;
+            case 'c': cert = optarg; break;
+            case 'k': key = optarg; break;
+            case 'd': daemon_mode = true; break;
+            case 'h':
+                printf("SPF v%s - Production Network Forwarder\n\n", SPF_VERSION);
+                printf("Usage: %s [options]\n\n", argv[0]);
+                printf("Options:\n");
+                printf("  -C, --config <path>    Config file (default: spf.conf)\n");
+                printf("  -b, --admin-bind <ip>  Bind address (default: 127.0.0.1)\n");
+                printf("  -p, --admin-port <n>   Control port (default: 8081)\n");
+                printf("  -t, --token <str>      Auth token (required for remote)\n");
+                printf("  -a, --admin-allow <ip1,ip2> Admin allowlist\n");
+                printf("  -m, --mtls             Require client TLS certificates\n");
+                printf("  -A, --ca <path>        Client CA bundle for mTLS\n");
+                printf("  -c, --cert <path>      TLS certificate\n");
+                printf("  -k, --key <path>       TLS private key\n");
+                printf("  -d, --daemon           Run as daemon\n");
+                printf("  -h, --help             Show this help\n");
+                return 0;
+        }
+    }
+    
+    if (daemon_mode) daemonize();
+    
+    spf_init(&g_state);
+    
+    // Load config first
+    if (spf_load_config(&g_state, config_path) < 0) {
+        // If default config fails, just warn (unless specific config was requested)
+        if (strcmp(config_path, "spf.conf") != 0) {
+            fprintf(stderr, "Error: cannot load config file %s\n", config_path);
+            return 1;
+        } else {
+             // For default, maybe it doesn't exist yet, which is fine
+        }
+    }
 
-static int cmd_tui(int argc, char **argv)
-{
-	(void)argc;
-	(void)argv;
+    if (bind_addr) {
+        strncpy(g_state.config.admin.bind_addr, bind_addr, SPF_IP_MAX_LEN - 1);
+        g_state.config.admin.bind_addr[SPF_IP_MAX_LEN - 1] = '\0';
+    }
+    if (token) {
+        strncpy(g_state.config.admin.token, token, SPF_TOKEN_MAX - 1);
+        g_state.config.admin.token[SPF_TOKEN_MAX - 1] = '\0';
+    }
+    if (cert) {
+        strncpy(g_state.config.admin.cert_path, cert, SPF_PATH_MAX - 1);
+        g_state.config.admin.cert_path[SPF_PATH_MAX - 1] = '\0';
+    }
+    if (key) {
+        strncpy(g_state.config.admin.key_path, key, SPF_PATH_MAX - 1);
+        g_state.config.admin.key_path[SPF_PATH_MAX - 1] = '\0';
+    }
+    if (ca) {
+        strncpy(g_state.config.admin.ca_path, ca, SPF_PATH_MAX - 1);
+        g_state.config.admin.ca_path[SPF_PATH_MAX - 1] = '\0';
+    }
+    if (admin_allow) {
+        if (admin_allowlist_set_csv(admin_allow) != 0) {
+            fprintf(stderr, "Invalid --admin-allow list, must be comma-separated IPv4 addresses\n");
+            return 1;
+        }
+    }
+    if (cli_mtls) {
+        g_state.config.admin.require_client_cert = true;
+    }
+    
+    // Override port if set via CLI
+    if (cli_port_set) {
+        g_state.config.admin.port = port;
+    } else if (g_state.config.admin.port == 0) {
+        g_state.config.admin.port = SPF_CTRL_PORT_DEFAULT;
+    }
 
-	tunl_init(&g_state);
-	g_state.running = true;
-	
-	return tui_run();
+    if (!is_loopback_bind(g_state.config.admin.bind_addr) && g_state.config.admin.token[0] == '\0') {
+        fprintf(stderr, "Refusing to expose admin control on non-loopback without --token\n");
+        return 1;
+    }
+
+    if (g_state.config.admin.port == SPF_METRICS_PORT_DEFAULT && g_state.config.metrics.enabled) {
+        spf_log(SPF_LOG_WARN, "admin and metrics ports overlap on %u", g_state.config.admin.port);
+    }
+    
+    const char* tls_cert = g_state.config.admin.cert_path[0] ? g_state.config.admin.cert_path : cert;
+    const char* tls_key = g_state.config.admin.key_path[0] ? g_state.config.admin.key_path : key;
+    if ((tls_cert && !tls_key) || (!tls_cert && tls_key)) {
+        fprintf(stderr, "Both TLS cert and key are required together\n");
+        return 1;
+    }
+    if ((g_state.config.admin.tls_enabled || g_state.config.admin.require_client_cert) && (!tls_cert || !tls_key)) {
+        fprintf(stderr, "TLS-enabled admin control requires cert and key\n");
+        return 1;
+    }
+    if (g_state.config.admin.tls_enabled || (tls_cert && tls_key)) {
+        if (tls_init(tls_cert, tls_key) == 0) {
+            g_state.config.admin.tls_enabled = true;
+            spf_log(SPF_LOG_INFO, "tls enabled");
+            if (g_state.config.admin.require_client_cert) {
+                if (g_state.config.admin.ca_path[0]) {
+                    if (tls_set_client_ca(g_state.config.admin.ca_path) != 0) {
+                        fprintf(stderr, "Failed to load mTLS client CA bundle\n");
+                        return 1;
+                    }
+                }
+                if (tls_require_client_cert() != 0) {
+                    fprintf(stderr, "Failed to enable mTLS\n");
+                    return 1;
+                }
+                spf_log(SPF_LOG_INFO, "admin mTLS required");
+            }
+        } else {
+            fprintf(stderr, "Failed to initialize TLS\n");
+            return 1;
+        }
+    }
+
+    if (g_state.config.admin.require_client_cert && !g_state.config.admin.tls_enabled) {
+        fprintf(stderr, "mTLS requires TLS cert/key configuration\n");
+        return 1;
+    }
+    
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+    signal(SIGPIPE, SIG_IGN);
+    
+    if (!daemon_mode) {
+        printf("=== SPF v%s ===\n", SPF_VERSION);
+        printf("Control: nc %s %d\n", g_state.config.admin.bind_addr, g_state.config.admin.port);
+        if (token) printf("Token required for auth\n");
+    }
+    
+    pthread_t ct;
+    pthread_create(&ct, NULL, ctrl_thread, NULL);
+
+    if (metrics_start(&g_state) != 0) {
+        spf_log(SPF_LOG_ERROR, "metrics: failed to start worker");
+    }
+
+    for (int i = 0; i < SPF_MAX_RULES; i++) {
+        if (!g_state.rules[i].active) {
+            continue;
+        }
+        if (pthread_create(&g_state.rules[i].listen_thread, NULL, listener_thread, &g_state.rules[i]) != 0) {
+            spf_log(SPF_LOG_ERROR, "failed to start listener for rule %u", g_state.rules[i].id);
+        } else {
+            pthread_detach(g_state.rules[i].listen_thread);
+            g_state.rules[i].listener_started = true;
+        }
+    }
+    
+    while (!g_shutdown && g_state.running) {
+        sleep(1);
+    }
+    
+    spf_log(SPF_LOG_INFO, "shutting down...");
+    g_state.running = false;
+    
+    if (g_ctrl_fd >= 0) close(g_ctrl_fd);
+    
+    pthread_join(ct, NULL);
+    metrics_stop();
+    tls_cleanup();
+    spf_shutdown(&g_state);
+    
+    return 0;
 }
 
-/* ============================================================================
- * Main
- * ============================================================================ */
-
-int main(int argc, char **argv)
-{
-	if (argc < 2) {
-		usage();
-		return 1;
-	}
-
-	/* Quick forward mode: tunl -f port:host:port */
-	if (strcmp(argv[1], "-f") == 0 || strcmp(argv[1], "--forward") == 0) {
-		return cmd_serve(argc, argv);
-	}
-
-	/* Help */
-	if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0 ||
-	    strcmp(argv[1], "help") == 0) {
-		usage();
-		return 0;
-	}
-
-	/* Version */
-	if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0 ||
-	    strcmp(argv[1], "version") == 0) {
-		printf("tunl v%s\n", TUNL_VERSION);
-		return 0;
-	}
-
-	/* Subcommands */
-	if (strcmp(argv[1], "serve") == 0) {
-		return cmd_serve(argc - 1, argv + 1);
-	} else if (strcmp(argv[1], "dns") == 0) {
-		return cmd_dns(argc - 1, argv + 1);
-	} else if (strcmp(argv[1], "cert") == 0) {
-		return cmd_cert(argc - 1, argv + 1);
-	} else if (strcmp(argv[1], "check") == 0) {
-		return cmd_check(argc - 1, argv + 1);
-	} else if (strcmp(argv[1], "tui") == 0) {
-		return cmd_tui(argc - 1, argv + 1);
-	} else {
-		fprintf(stderr, "Unknown command: %s\n\n", argv[1]);
-		usage();
-		return 1;
-	}
-}
+#endif

@@ -1,169 +1,342 @@
-# tunl - IPv6-First Self-Hosting Toolkit
+# SPF - Secure Public Forwarder
 
-**Host services from home using IPv6. No VPS, no NAT, no web interfaces.**
-
-## What is tunl?
-
-tunl is a complete **self-hosting toolkit** for home servers. With IPv6, every device on your network has a globally routable public IP—no NAT, no port forwarding, no VPS required.
+**The safest way to expose self-hosted TCP services to the public with a tiny footprint.**
 
 ```
-                                 IPv6 Internet
-                                       │
-┌───────────────────────────────────────┼───────────────────────────────────────┐
-│  Your Home Network                    │                                       │
-│                                       ▼                                       │
-│  ┌─────────────┐            ┌─────────────────┐           ┌─────────────────┐ │
-│  │   Laptop    │◀───────────│      tunl       │◀──────────│  Internet User  │ │
-│  │ 2001:db8::2 │            │  [::]::8080     │           │                 │ │
-│  └─────────────┘            │  (public IPv6)  │           └─────────────────┘ │
-│                             └─────────────────┘                               │
-└───────────────────────────────────────────────────────────────────────────────┘
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   Clients   │────▶│     SPF      │────▶│  Backends   │
+│             │◀────│  TLS + LB    │◀────│             │
+└─────────────┘     └──────────────┘     └─────────────┘
+                           │
+                    ┌──────┴──────┐
+                    │ SIEM Engine │
+                    │ Health Chks │
+                    │  Metrics    │
+                    └─────────────┘
 ```
+
+## Architecture
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        C1[Client 1]
+        C2[Client 2]
+        C3[Client N]
+    end
+    
+    subgraph "SPF Core"
+        TLS[TLS Termination]
+        AUTH[Auth Layer]
+        LB[Load Balancer]
+        HC[Health Checker]
+        SIEM[SIEM Engine]
+        LOG[Audit Logger]
+    end
+    
+    subgraph "Backend Pool"
+        B1[Backend 1]
+        B2[Backend 2]
+        B3[Backend N]
+    end
+    
+    C1 --> TLS
+    C2 --> TLS
+    C3 --> TLS
+    TLS --> AUTH
+    AUTH --> LB
+    LB --> B1
+    LB --> B2
+    LB --> B3
+    HC --> B1
+    HC --> B2
+    HC --> B3
+    AUTH --> SIEM
+    SIEM --> LOG
+```
+
+## Positioning (Painpoint First)
+
+The strongest painpoint SPF targets is this:
+
+**"I need to expose my app publicly, but I do not want to run a massive reverse-proxy stack or accidentally expose an unauthenticated admin/control plane."**
+
+SPF is built for operators who want:
+- dynamic L4 forwarding
+- strict defaults around control-plane safety
+- small binary, simple deployment, and high signal observability
+
+## Features
+
+### Core
+- **TCP Port Forwarding** - High-performance L4 proxy
+- **TLS Termination** - OpenSSL with TLS 1.2+
+- **Load Balancing** - Round-robin, least-conn, IP-hash, weighted
+- **Health Checks** - Auto-detect backend failures
+- **Rate Limiting** - Per-IP and global token bucket
+
+### Enterprise Security (SIEM)
+- **Audit Logging** - JSON structured events
+- **IP Blocking** - Manual and automatic (brute-force)
+- **Geo-IP Blocking** - Block by country
+- **Threat Intelligence** - External blocklist feeds
+- **Anomaly Detection** - Traffic pattern analysis
+- **PROXY Protocol v2** - Preserve client IPs
+- **Webhook Alerts** - Slack/Discord/PagerDuty
+
+### Operations
+- **Prometheus Metrics** - Full observability
+- **Live Control** - TCP control protocol
+- **Hot Reload** - Change rules without restart
+- **Daemon Mode** - Background service
+- **Cross-Platform** - Linux, macOS, Windows, ESP32
+
+### Reliability & Safety Defaults
+- **Config Rules Start on Boot** - Persisted rules are actively started at launch
+- **Safer Forwarding Path** - Handles partial socket writes to avoid data truncation
+- **Hardened Input Parsing** - Strict numeric parsing for ports/rates in config and CLI
+- **Control-Plane Guardrail** - Refuses non-loopback admin bind without token
 
 ## Quick Start
 
 ```bash
-# Build
+# build
 make
 
-# Forward port 8080 to your local app on port 3000
-./bin/tunl -f 8080:localhost:3000
+# run with auth token
+./bin/spf --token mysecret
 
-# That's it. You're live on IPv6.
+# connect control
+nc localhost 8081
+> AUTH mysecret
+> ADD 8080 10.0.0.1:80,10.0.0.2:80 rr
+> STATUS
 ```
 
-## Features
-
-- **~50KB binary** - minimal, focused, no bloat
-- **IPv6-first** - dual-stack sockets (accepts IPv4 and IPv6)
-- **Load balancing** - round-robin, least-connections, IP-hash
-- **Health checks** - automatic backend failover
-- **Rate limiting** - per-IP connection throttling
-- **DNS updates** - automatic IPv6 prefix change detection
-- **ACME/Let's Encrypt** - automatic TLS certificates
-- **Reachability check** - verify your setup works
-- **Terminal UI** - ncurses dashboard (or ANSI fallback)
-
-## Commands
+Run validation quickly:
 
 ```bash
-tunl serve [options]      # Start proxy server
-tunl dns [options]        # DNS dynamic updates
-tunl cert [options]       # TLS certificates (ACME)
-tunl check [options]      # Reachability test
-tunl tui                  # Terminal dashboard
-tunl -f <port:host:port>  # Quick forward mode
+make test
 ```
+
+Use the hardened config template:
+
+```bash
+cp spf.conf.example spf.conf
+```
+
+## Safe Exposure Checklist
+
+Use this checklist before exposing SPF on a public or shared network:
+
+1. Always set `--token` (or `admin.token` in config).
+2. Keep admin bind on loopback unless absolutely required.
+3. If exposing admin remotely, require TLS/mTLS and firewall-restrict source IPs.
+4. Enable `security.enabled = true` and set reasonable rate limits.
+5. Scrape metrics and alert on `spf_blocked_total`, backend down events, and active connection spikes.
+
+SPF enforces one guardrail by default now: if admin bind is non-loopback and no token is set, startup fails.
 
 ## Installation
 
 ```bash
-# Build from source
+# debian/ubuntu
+make install-deps-debian
+make
+sudo make install
+sudo make install-service
+
+# arch
+make install-deps-arch
 make
 sudo make install
 
-# Dependencies (Debian/Ubuntu)
-sudo apt install build-essential libssl-dev
-
-# Optional: ncurses for enhanced TUI
-sudo apt install libncurses-dev
-make CFLAGS+="-DHAVE_NCURSES" LIBS+="-lncurses"
+# macos
+make install-deps-macos
+make
+sudo make install
 ```
 
-## Usage Examples
+## Control Protocol
 
-### Quick forward
+```
+AUTH <token>              # authenticate first
+STATUS                    # system overview  
+RULES                     # list all rules
+BACKENDS <id>             # show backends for rule
+ADD <port> <backends> [algo]  # add forwarding rule
+DEL <id>                  # delete rule
+PAUSE <id>                # stop accepting new conns for rule
+RESUME <id>               # resume accepting for rule
+DRAIN <id> <idx> [sec]    # gracefully drain backend index
+SETWEIGHT <id> <idx> <w>  # set backend weight
+SETSTATE <id> <idx> <UP|DOWN|DRAIN>  # force backend state
+HEALTH <id>               # backend health snapshot
+ADMINALLOWLIST            # list admin allowlist IPs
+ADMINALLOW <ip>           # add admin allowlist IP
+ADMINDENY <ip>            # remove admin allowlist IP
+ADMINSET <ip1,ip2,...>    # replace admin allowlist
+SAVE                      # persist runtime config to disk
+RELOAD                    # reload config from disk
+BLOCK <ip> [seconds]      # block IP
+UNBLOCK <ip>              # unblock IP  
+LOGS [n]                  # recent security events
+METRICS                   # prometheus format
+QUIT                      # close connection
+```
+
+### Examples
 
 ```bash
-# Forward port 8080 to localhost:3000
-tunl -f 8080:localhost:3000
+# add rule with 3 backends, round-robin
+ADD 443 10.0.0.1:8080,10.0.0.2:8080,10.0.0.3:8080 rr
+
+# add rule with least-connections
+ADD 80 web1:8080,web2:8080 lc
+
+# add sticky sessions (IP hash)
+ADD 3000 app1:3000,app2:3000 ip
+
+# block abusive IP for 1 hour
+BLOCK 1.2.3.4 3600
+
+# drain backend 1 on rule 12345 with 20s timeout
+DRAIN 12345 1 20
+
+# pause and resume rule traffic admission
+PAUSE 12345
+RESUME 12345
 ```
 
-### DNS dynamic update
+## CLI Options
 
-When your ISP changes your IPv6 prefix, tunl updates your DNS:
+```
+-b, --admin-bind <ip>   Control bind address (default: 127.0.0.1)
+-p, --admin-port <n>    Control port (default: 8081)
+-t, --token <str>       Auth token (recommended)
+-a, --admin-allow <ips> Comma-separated admin IP allowlist
+-m, --mtls              Require admin client certificate
+-A, --ca <path>         Client CA bundle for mTLS
+-c, --cert <path>       TLS certificate
+-k, --key <path>        TLS private key
+-d, --daemon            Run as background daemon
+-h, --help              Show help
+```
+
+## Hardened Admin Control
+
+- Admin API supports IP allowlist (`admin.allowlist` / `--admin-allow`).
+- Admin API supports TLS and optional client certificate enforcement (mTLS, optional `admin.ca` / `--ca`).
+- Unknown or invalid allowlist IPs are rejected from CLI and ignored with warnings in config parsing.
+
+## Load Balancing Algorithms
+
+| Algo | Flag | Description |
+|------|------|-------------|
+| Round Robin | `rr` | Default, rotate through backends |
+| Least Connections | `lc` | Route to least busy backend |
+| IP Hash | `ip` | Sticky sessions by client IP |
+| Weighted | `w` | Weighted distribution |
+
+## Security Events
+
+SPF logs these security events:
+
+| Event | Description |
+|-------|-------------|
+| `CONN_OPEN` | New connection established |
+| `CONN_CLOSE` | Connection closed |
+| `AUTH_FAIL` | Failed authentication attempt |
+| `BLOCKED` | IP blocked (rate limit) |
+| `RATE_LIMITED` | Request rate limited |
+| `HEALTH_DOWN` | Backend failed health check |
+| `HEALTH_UP` | Backend recovered |
+| `GEOBLOCK` | Blocked by geo-IP |
+| `THREAT_MATCH` | IP matched threat intel |
+| `ANOMALY` | Unusual traffic pattern |
+| `DDOS` | Potential DDoS detected |
+
+## Prometheus Metrics
+
+```
+spf_connections_active    # current connections
+spf_connections_total     # total since start
+spf_bytes_in_total        # bytes received
+spf_bytes_out_total       # bytes sent
+spf_blocked_total         # blocked IPs
+spf_rules_active          # active rules
+```
+
+## ESP32 Support
+
+SPF runs on ESP32 for edge/IoT scenarios:
 
 ```bash
-# Cloudflare
-tunl dns --provider cf --hostname myhost.example.com --token YOUR_API_TOKEN
+# configure via serial first boot
+SETUP YourSSID YourPassword YourAuthToken
 
-# Monitor for changes (runs continuously)
-tunl dns --provider cf --hostname myhost.example.com --token YOUR_API_TOKEN --monitor
+# then control via network
+nc 192.168.1.x 8081
 ```
 
-### TLS certificates
+Credentials stored in NVS flash - no hardcoded secrets.
 
-Get free Let's Encrypt certificates:
+## File Structure
+
+```
+src/
+├── common.h    # shared types and limits
+├── core.c      # state, blocking, load balancing
+├── server.cpp  # main server (linux/mac/win)
+└── esp32.cpp   # embedded variant
+```
+
+## vs Competitors
+
+| Feature | SPF | socat | rinetd | HAProxy | nginx |
+|---------|-----|-------|--------|---------|-------|
+| Dynamic rules | ✅ | ❌ | ❌ | ✅ | ⚠️ |
+| Load balancing | ✅ | ❌ | ❌ | ✅ | ✅ |
+| Health checks | ✅ | ❌ | ❌ | ✅ | ✅ |
+| TLS | ✅ | ✅ | ❌ | ✅ | ✅ |
+| SIEM/Security | ✅ | ❌ | ❌ | ⚠️ | ⚠️ |
+| ESP32/IoT | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Binary size | ~50KB | ~500KB | ~20KB | ~2MB | ~5MB |
+
+### Where SPF Wins
+- minimal footprint and setup time for dynamic L4 forwarding
+- strong control-plane guardrails for small teams/self-hosters
+- practical security + observability in one binary
+
+### Where Others Still Win
+- massive plugin/ecosystem depth
+- advanced L7 traffic policy and enterprise integrations
+- long-standing production adoption at hyperscale
+
+## Building
 
 ```bash
-# Get certificate
-tunl cert --domain myhost.example.com --email you@example.com
+# release
+make
 
-# Test with staging first
-tunl cert --domain myhost.example.com --email you@example.com --staging
+# debug with sanitizers
+make debug
+
+# cross compile
+make cross-arm
+make cross-aarch64
+make cross-windows
+
+# info
+make info
+
+# build + smoke integration tests
+make test
+
+# run documented CLI workflow tests explicitly
+make test-cli
 ```
-
-### Reachability check
-
-Verify your setup works:
-
-```bash
-tunl check --hostname myhost.example.com --port 443
-```
-
-### Terminal dashboard
-
-Live monitoring:
-
-```bash
-tunl tui
-```
-
-### Config file
-
-```ini
-# tunl.conf
-[admin]
-bind = ::1
-port = 8081
-token = your-secret-token
-
-[rule.1]
-listen = 8080
-backend = localhost:3000
-backend = localhost:3001
-lb = rr
-max_conns = 512
-```
-
-```bash
-tunl serve -C tunl.conf
-```
-
-## Why IPv6?
-
-Every IPv6-enabled home network has **public addresses for every device**:
-
-- ❌ No NAT / CGNAT
-- ❌ No port forwarding
-- ❌ No VPS costs
-- ❌ No third-party tunnels
-
-Check your IPv6: `curl -6 ifconfig.me`
-
-## Code Quality
-
-This codebase follows Linux kernel coding standards:
-
-- **~2,000 lines total** (9 clean modules)
-- **epoll-based** I/O multiplexing
-- **No memory leaks** - proper cleanup
-- **Minimal dependencies** - OpenSSL and pthreads
 
 ## License
 
-GPL-2.0. See [LICENSE](LICENSE).
-
----
-
-*IPv6 first. One binary, one command, your service is online.*
+GPL-2.0

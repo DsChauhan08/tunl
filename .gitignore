@@ -4,4 +4,4 @@ build/
 *.d
 .DS_Store
 PACKAGING.md
-.vscode/
+spf.conf
