@@ -26,6 +26,9 @@ static const metric_def_t metrics[] = {
     {"spf_blocked_total", "Total blocked IPs", "counter"},
     {"spf_rules_active", "Active forwarding rules", "gauge"},
     {"spf_uptime_seconds", "Uptime in seconds", "counter"},
+    {"spf_admin_auth_failures_total", "Failed admin authentications", "counter"},
+    {"spf_admin_lockouts_total", "Admin lockouts triggered", "counter"},
+    {"spf_admin_cmd_rate_limited_total", "Admin commands rate-limited", "counter"},
     {NULL, NULL, NULL}
 };
 
@@ -61,14 +64,20 @@ int metrics_format(spf_state_t* state, char* buf, size_t len) {
         "spf_bytes_out_total %lu\n"
         "spf_blocked_total %lu\n"
         "spf_rules_active %u\n"
-        "spf_uptime_seconds %lu\n",
+        "spf_uptime_seconds %lu\n"
+        "spf_admin_auth_failures_total %lu\n"
+        "spf_admin_lockouts_total %lu\n"
+        "spf_admin_cmd_rate_limited_total %lu\n",
         state->active_conns,
         state->total_conns,
         state->total_bytes_in,
         state->total_bytes_out,
         state->blocked_count,
         state->rule_count,
-        uptime);
+        uptime,
+        state->admin_auth_failures,
+        state->admin_lockouts,
+        state->admin_cmd_rate_limited);
     pthread_mutex_unlock(&state->stats_lock);
 
     for (int i = 0; i < SPF_MAX_RULES; i++) {

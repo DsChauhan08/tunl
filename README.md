@@ -83,6 +83,10 @@ SPF is built for operators who want:
 - **Anomaly Detection** - Traffic pattern analysis
 - **PROXY Protocol v2** - Preserve client IPs
 - **Webhook Alerts** - Slack/Discord/PagerDuty
+- **Admin Lockout & Rate Limiting** - Brute-force and abuse protection on control plane
+- **Readonly Control Sessions** - Separate readonly token for safe ops access
+- **Tamper-Evident Audit Chain** - JSON audit entries with hash chaining
+- **Dual-Control Config Apply** - Stage/apply/rollback workflow for admin config changes
 
 ### Operations
 - **Prometheus Metrics** - Full observability
@@ -178,6 +182,11 @@ ADMINDENY <ip>            # remove admin allowlist IP
 ADMINSET <ip1,ip2,...>    # replace admin allowlist
 SAVE                      # persist runtime config to disk
 RELOAD                    # reload config from disk
+READONLY ON|OFF           # toggle global readonly mode
+STAGE <key> <value>       # stage admin config change
+APPLY                     # apply staged admin config changes
+ROLLBACK                  # rollback most recent APPLY
+TLSINFO                   # show TLS + admin security posture
 BLOCK <ip> [seconds]      # block IP
 UNBLOCK <ip>              # unblock IP  
 LOGS [n]                  # recent security events
@@ -214,6 +223,7 @@ RESUME 12345
 -b, --admin-bind <ip>   Control bind address (default: 127.0.0.1)
 -p, --admin-port <n>    Control port (default: 8081)
 -t, --token <str>       Auth token (recommended)
+-r, --readonly          Start in readonly admin mode
 -a, --admin-allow <ips> Comma-separated admin IP allowlist
 -m, --mtls              Require admin client certificate
 -A, --ca <path>         Client CA bundle for mTLS
@@ -227,7 +237,40 @@ RESUME 12345
 
 - Admin API supports IP allowlist (`admin.allowlist` / `--admin-allow`).
 - Admin API supports TLS and optional client certificate enforcement (mTLS, optional `admin.ca` / `--ca`).
+- Admin API supports readonly sessions (`readonly_token`) and global readonly mode.
+- Admin API supports brute-force lockout and command rate-limits (`auth_fail_threshold`, `auth_lockout_sec`, `max_cmds_per_min`).
+- Admin API supports dual-control flow: `STAGE` -> `APPLY` with `ROLLBACK` safety.
+- Audit events are persisted as JSON lines with `prev_hash` and `hash` for tamper-evident chaining (`admin.audit_log`).
 - Unknown or invalid allowlist IPs are rejected from CLI and ignored with warnings in config parsing.
+
+## Backend TLS Verification and Pinning
+
+Per-backend TLS to upstream targets supports:
+- `backend_tls = true` for encrypted upstream transport.
+- `backend_tls_verify = true` for certificate validation + hostname checks.
+- `backend_tls_ca` to set trust roots for upstream verification.
+- `backend_tls_sni` for explicit SNI/hostname validation target.
+- `backend_tls_pin_sha256` for SHA-256 DER pin validation.
+
+Use this to enforce zero-trust upstream identity checks when forwarding to remote/private backends.
+
+## Sanitizers and Fuzzing
+
+```bash
+# address sanitizer build
+make asan
+
+# undefined behavior sanitizer build
+make ubsan
+
+# both sanitizer builds
+make sanitizers
+
+# build control parser fuzz harness
+make fuzz-ctrl
+```
+
+CI runs sanitizer jobs and fuzz harness build in `.github/workflows/sanitizers.yml`.
 
 ## Load Balancing Algorithms
 

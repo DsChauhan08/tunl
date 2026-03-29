@@ -5,6 +5,13 @@ token = change-me
 tls = false
 mtls = false
 ca = /etc/ssl/certs/ca-certificates.crt
+readonly = false
+readonly_token = change-me-readonly
+max_cmds_per_min = 240
+auth_fail_threshold = 5
+auth_lockout_sec = 300
+idle_timeout_sec = 300
+audit_log = /var/log/spf_audit.log
 allowlist = 127.0.0.1
 
 [security]
@@ -22,4 +29,9 @@ port = 9100
 listen = 8080
 lb = rr
 backend = 127.0.0.1:9000:1
+backend_tls = false
+backend_tls_verify = false
+# backend_tls_sni = backend.local
+# backend_tls_ca = /etc/ssl/certs/ca-certificates.crt
+# backend_tls_pin_sha256 = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 rate = 104857600

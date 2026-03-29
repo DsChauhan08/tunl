@@ -35,6 +35,413 @@ typedef struct {
     uint32_t conn_idx;
 } session_t;
 
+typedef enum {
+    ADMIN_ROLE_NONE = 0,
+    ADMIN_ROLE_READONLY,
+    ADMIN_ROLE_ADMIN
+} admin_role_t;
+
+typedef struct {
+    char ip[SPF_IP_MAX_LEN];
+    uint32_t auth_failures;
+    uint64_t lockout_until;
+    uint64_t cmd_window_start;
+    uint32_t cmd_count;
+    bool in_use;
+} admin_tracker_t;
+
+static admin_tracker_t g_admin_trackers[SPF_MAX_ADMIN_TRACKERS];
+static pthread_mutex_t g_admin_tracker_lock = PTHREAD_MUTEX_INITIALIZER;
+static void apply_admin_security_defaults(void);
+
+static bool parse_u32_strict(const char* s, uint32_t* out) {
+    if (!s || !*s || !out) {
+        return false;
+    }
+    char* end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v > 0xFFFFFFFFUL) {
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+static bool parse_u64_strict(const char* s, uint64_t* out) {
+    if (!s || !*s || !out) {
+        return false;
+    }
+    char* end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        return false;
+    }
+    *out = (uint64_t)v;
+    return true;
+}
+
+static bool secure_token_equals(const char* expected, const char* provided) {
+    if (!expected || !provided || expected[0] == '\0') {
+        return false;
+    }
+
+    size_t a = strlen(expected);
+    size_t b = strlen(provided);
+    if (a != b) {
+        return false;
+    }
+
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < a; i++) {
+        diff |= (uint8_t)(expected[i] ^ provided[i]);
+    }
+    return diff == 0;
+}
+
+static bool is_write_command(const char* cmd) {
+    if (!cmd || !*cmd) {
+        return false;
+    }
+
+    return strncmp(cmd, "ADD ", 4) == 0 ||
+           strncmp(cmd, "DEL ", 4) == 0 ||
+           strncmp(cmd, "PAUSE ", 6) == 0 ||
+           strncmp(cmd, "RESUME ", 7) == 0 ||
+           strncmp(cmd, "DRAIN ", 6) == 0 ||
+           strncmp(cmd, "SETWEIGHT ", 10) == 0 ||
+           strncmp(cmd, "SETSTATE ", 9) == 0 ||
+           strncmp(cmd, "ADMINALLOW ", 11) == 0 ||
+           strncmp(cmd, "ADMINDENY ", 10) == 0 ||
+           strncmp(cmd, "ADMINSET ", 9) == 0 ||
+           strncmp(cmd, "BLOCK ", 6) == 0 ||
+           strncmp(cmd, "UNBLOCK ", 8) == 0 ||
+           strncmp(cmd, "STAGE ", 6) == 0 ||
+           strncmp(cmd, "APPLY", 5) == 0 ||
+           strncmp(cmd, "ROLLBACK", 8) == 0 ||
+           strncmp(cmd, "SAVE", 4) == 0 ||
+           strncmp(cmd, "RELOAD", 6) == 0;
+}
+
+static const char* admin_role_str(admin_role_t role) {
+    if (role == ADMIN_ROLE_ADMIN) return "admin";
+    if (role == ADMIN_ROLE_READONLY) return "readonly";
+    return "none";
+}
+
+static const char* ctrl_cmd_name(spf_ctrl_cmd_kind_t kind) {
+    switch (kind) {
+        case SPF_CTRL_CMD_AUTH: return "AUTH";
+        case SPF_CTRL_CMD_STATUS: return "STATUS";
+        case SPF_CTRL_CMD_RULES: return "RULES";
+        case SPF_CTRL_CMD_BACKENDS: return "BACKENDS";
+        case SPF_CTRL_CMD_ADD: return "ADD";
+        case SPF_CTRL_CMD_DEL: return "DEL";
+        case SPF_CTRL_CMD_PAUSE: return "PAUSE";
+        case SPF_CTRL_CMD_RESUME: return "RESUME";
+        case SPF_CTRL_CMD_DRAIN: return "DRAIN";
+        case SPF_CTRL_CMD_SETWEIGHT: return "SETWEIGHT";
+        case SPF_CTRL_CMD_SETSTATE: return "SETSTATE";
+        case SPF_CTRL_CMD_ADMINALLOWLIST: return "ADMINALLOWLIST";
+        case SPF_CTRL_CMD_ADMINALLOW: return "ADMINALLOW";
+        case SPF_CTRL_CMD_ADMINDENY: return "ADMINDENY";
+        case SPF_CTRL_CMD_ADMINSET: return "ADMINSET";
+        case SPF_CTRL_CMD_SAVE: return "SAVE";
+        case SPF_CTRL_CMD_RELOAD: return "RELOAD";
+        case SPF_CTRL_CMD_HEALTH: return "HEALTH";
+        case SPF_CTRL_CMD_READONLY: return "READONLY";
+        case SPF_CTRL_CMD_BLOCK: return "BLOCK";
+        case SPF_CTRL_CMD_UNBLOCK: return "UNBLOCK";
+        case SPF_CTRL_CMD_LOGS: return "LOGS";
+        case SPF_CTRL_CMD_METRICS: return "METRICS";
+        case SPF_CTRL_CMD_TLSINFO: return "TLSINFO";
+        case SPF_CTRL_CMD_STAGE: return "STAGE";
+        case SPF_CTRL_CMD_APPLY: return "APPLY";
+        case SPF_CTRL_CMD_ROLLBACK: return "ROLLBACK";
+        case SPF_CTRL_CMD_QUIT: return "QUIT";
+        case SPF_CTRL_CMD_HELP: return "HELP";
+        default: return "UNKNOWN";
+    }
+}
+
+static bool staged_admin_key_allowed(const char* key) {
+    return key && (
+        strcmp(key, "readonly") == 0 ||
+        strcmp(key, "max_cmds_per_min") == 0 ||
+        strcmp(key, "auth_fail_threshold") == 0 ||
+        strcmp(key, "auth_lockout_sec") == 0 ||
+        strcmp(key, "idle_timeout_sec") == 0 ||
+        strcmp(key, "allowlist") == 0 ||
+        strcmp(key, "audit_log") == 0
+    );
+}
+
+static int stage_config_change(const char* key, const char* value) {
+    if (!key || !*key || !value || !*value || !staged_admin_key_allowed(key)) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_state.lock);
+    for (uint32_t i = 0; i < g_state.staged_change_count; i++) {
+        if (strcmp(g_state.staged_changes[i].key, key) == 0) {
+            strncpy(g_state.staged_changes[i].value, value, sizeof(g_state.staged_changes[i].value) - 1);
+            g_state.staged_changes[i].value[sizeof(g_state.staged_changes[i].value) - 1] = '\0';
+            pthread_mutex_unlock(&g_state.lock);
+            return 0;
+        }
+    }
+
+    if (g_state.staged_change_count >= SPF_MAX_STAGED_CHANGES) {
+        pthread_mutex_unlock(&g_state.lock);
+        return -2;
+    }
+
+    spf_staged_change_t* ch = &g_state.staged_changes[g_state.staged_change_count++];
+    strncpy(ch->key, key, sizeof(ch->key) - 1);
+    ch->key[sizeof(ch->key) - 1] = '\0';
+    strncpy(ch->value, value, sizeof(ch->value) - 1);
+    ch->value[sizeof(ch->value) - 1] = '\0';
+    pthread_mutex_unlock(&g_state.lock);
+    return 0;
+}
+
+static int apply_staged_changes(void) {
+    pthread_mutex_lock(&g_state.lock);
+    if (g_state.staged_change_count == 0) {
+        pthread_mutex_unlock(&g_state.lock);
+        return 1;
+    }
+
+    g_state.last_admin_snapshot = g_state.config.admin;
+    g_state.has_admin_snapshot = true;
+
+    for (uint32_t i = 0; i < g_state.staged_change_count; i++) {
+        const char* key = g_state.staged_changes[i].key;
+        const char* val = g_state.staged_changes[i].value;
+        if (strcmp(key, "readonly") == 0) {
+            g_state.config.admin.read_only_mode = strcmp(val, "true") == 0 || strcmp(val, "on") == 0;
+        } else if (strcmp(key, "max_cmds_per_min") == 0) {
+            uint32_t v = 0;
+            if (!parse_u32_strict(val, &v)) {
+                g_state.config.admin = g_state.last_admin_snapshot;
+                pthread_mutex_unlock(&g_state.lock);
+                return -1;
+            }
+            g_state.config.admin.max_cmds_per_min = v;
+        } else if (strcmp(key, "auth_fail_threshold") == 0) {
+            uint32_t v = 0;
+            if (!parse_u32_strict(val, &v)) {
+                g_state.config.admin = g_state.last_admin_snapshot;
+                pthread_mutex_unlock(&g_state.lock);
+                return -1;
+            }
+            g_state.config.admin.auth_fail_threshold = v;
+        } else if (strcmp(key, "auth_lockout_sec") == 0) {
+            uint32_t v = 0;
+            if (!parse_u32_strict(val, &v)) {
+                g_state.config.admin = g_state.last_admin_snapshot;
+                pthread_mutex_unlock(&g_state.lock);
+                return -1;
+            }
+            g_state.config.admin.auth_lockout_sec = v;
+        } else if (strcmp(key, "idle_timeout_sec") == 0) {
+            uint32_t v = 0;
+            if (!parse_u32_strict(val, &v)) {
+                g_state.config.admin = g_state.last_admin_snapshot;
+                pthread_mutex_unlock(&g_state.lock);
+                return -1;
+            }
+            g_state.config.admin.idle_timeout_sec = v;
+        } else if (strcmp(key, "allowlist") == 0) {
+            char parsed[SPF_MAX_ADMIN_ALLOWLIST][SPF_IP_MAX_LEN];
+            uint8_t count = 0;
+            char tmp[512];
+            strncpy(tmp, val, sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+
+            char* saveptr = NULL;
+            char* tok = strtok_r(tmp, ",", &saveptr);
+            while (tok && count < SPF_MAX_ADMIN_ALLOWLIST) {
+                while (*tok == ' ' || *tok == '\t') tok++;
+                char* end = tok + strlen(tok);
+                while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) {
+                    end--;
+                }
+                *end = '\0';
+
+                if (*tok) {
+                    struct in_addr parsed_ip;
+                    if (inet_pton(AF_INET, tok, &parsed_ip) != 1) {
+                        g_state.config.admin = g_state.last_admin_snapshot;
+                        pthread_mutex_unlock(&g_state.lock);
+                        return -1;
+                    }
+                    strncpy(parsed[count], tok, SPF_IP_MAX_LEN - 1);
+                    parsed[count][SPF_IP_MAX_LEN - 1] = '\0';
+                    count++;
+                }
+                tok = strtok_r(NULL, ",", &saveptr);
+            }
+
+            g_state.config.admin.allowlist_count = count;
+            for (uint8_t j = 0; j < count; j++) {
+                strncpy(g_state.config.admin.allowlist[j], parsed[j], SPF_IP_MAX_LEN - 1);
+                g_state.config.admin.allowlist[j][SPF_IP_MAX_LEN - 1] = '\0';
+            }
+        } else if (strcmp(key, "audit_log") == 0) {
+            if (!val[0]) {
+                g_state.config.admin = g_state.last_admin_snapshot;
+                pthread_mutex_unlock(&g_state.lock);
+                return -1;
+            }
+            strncpy(g_state.config.admin.audit_log_path, val, SPF_PATH_MAX - 1);
+            g_state.config.admin.audit_log_path[SPF_PATH_MAX - 1] = '\0';
+        }
+    }
+
+    g_state.staged_change_count = 0;
+    pthread_mutex_unlock(&g_state.lock);
+    apply_admin_security_defaults();
+    return 0;
+}
+
+static int rollback_last_admin_apply(void) {
+    pthread_mutex_lock(&g_state.lock);
+    if (!g_state.has_admin_snapshot) {
+        pthread_mutex_unlock(&g_state.lock);
+        return 1;
+    }
+    g_state.config.admin = g_state.last_admin_snapshot;
+    g_state.has_admin_snapshot = false;
+    g_state.staged_change_count = 0;
+    pthread_mutex_unlock(&g_state.lock);
+    apply_admin_security_defaults();
+    return 0;
+}
+
+static void apply_admin_security_defaults(void) {
+    if (g_state.config.admin.max_cmds_per_min == 0) {
+        g_state.config.admin.max_cmds_per_min = 240;
+    }
+    if (g_state.config.admin.auth_fail_threshold == 0) {
+        g_state.config.admin.auth_fail_threshold = 5;
+    }
+    if (g_state.config.admin.auth_lockout_sec == 0) {
+        g_state.config.admin.auth_lockout_sec = 300;
+    }
+    if (g_state.config.admin.idle_timeout_sec == 0) {
+        g_state.config.admin.idle_timeout_sec = 300;
+    }
+}
+
+static admin_tracker_t* admin_tracker_get_or_create_unsafe(const char* ip, uint64_t now_sec) {
+    int free_idx = -1;
+    int evict_idx = 0;
+    uint64_t oldest = UINT64_MAX;
+
+    for (int i = 0; i < SPF_MAX_ADMIN_TRACKERS; i++) {
+        admin_tracker_t* t = &g_admin_trackers[i];
+        if (t->in_use) {
+            if (strcmp(t->ip, ip) == 0) {
+                return t;
+            }
+
+            uint64_t age_key = t->cmd_window_start;
+            if (age_key == 0) {
+                age_key = now_sec;
+            }
+            if (age_key < oldest) {
+                oldest = age_key;
+                evict_idx = i;
+            }
+        } else if (free_idx < 0) {
+            free_idx = i;
+        }
+    }
+
+    int idx = free_idx >= 0 ? free_idx : evict_idx;
+    admin_tracker_t* out = &g_admin_trackers[idx];
+    memset(out, 0, sizeof(*out));
+    out->in_use = true;
+    out->cmd_window_start = now_sec;
+    strncpy(out->ip, ip, SPF_IP_MAX_LEN - 1);
+    out->ip[SPF_IP_MAX_LEN - 1] = '\0';
+    return out;
+}
+
+static bool admin_tracker_locked(const char* ip, uint64_t now_sec, uint32_t* remaining_sec) {
+    pthread_mutex_lock(&g_admin_tracker_lock);
+    admin_tracker_t* t = admin_tracker_get_or_create_unsafe(ip, now_sec);
+
+    bool locked = false;
+    if (t->lockout_until > now_sec) {
+        locked = true;
+        if (remaining_sec) {
+            *remaining_sec = (uint32_t)(t->lockout_until - now_sec);
+        }
+    } else if (t->lockout_until > 0 && t->lockout_until <= now_sec) {
+        t->lockout_until = 0;
+        t->auth_failures = 0;
+    }
+
+    pthread_mutex_unlock(&g_admin_tracker_lock);
+    return locked;
+}
+
+static bool admin_tracker_allow_cmd(const char* ip, uint64_t now_sec, uint32_t limit) {
+    if (limit == 0) {
+        return true;
+    }
+
+    pthread_mutex_lock(&g_admin_tracker_lock);
+    admin_tracker_t* t = admin_tracker_get_or_create_unsafe(ip, now_sec);
+
+    if (t->cmd_window_start == 0 || now_sec < t->cmd_window_start || (now_sec - t->cmd_window_start) >= 60) {
+        t->cmd_window_start = now_sec;
+        t->cmd_count = 0;
+    }
+
+    bool allowed = t->cmd_count < limit;
+    if (allowed) {
+        t->cmd_count++;
+    }
+
+    pthread_mutex_unlock(&g_admin_tracker_lock);
+    return allowed;
+}
+
+static bool admin_tracker_auth_fail(const char* ip, uint64_t now_sec,
+                                    uint32_t threshold, uint32_t lockout_sec,
+                                    uint32_t* lockout_remaining) {
+    pthread_mutex_lock(&g_admin_tracker_lock);
+    admin_tracker_t* t = admin_tracker_get_or_create_unsafe(ip, now_sec);
+
+    t->auth_failures++;
+    bool locked = false;
+
+    if (threshold > 0 && t->auth_failures >= threshold) {
+        uint32_t dur = lockout_sec ? lockout_sec : 60;
+        t->lockout_until = now_sec + dur;
+        t->auth_failures = 0;
+        locked = true;
+        if (lockout_remaining) {
+            *lockout_remaining = dur;
+        }
+    }
+
+    pthread_mutex_unlock(&g_admin_tracker_lock);
+    return locked;
+}
+
+static void admin_tracker_auth_success(const char* ip, uint64_t now_sec) {
+    pthread_mutex_lock(&g_admin_tracker_lock);
+    admin_tracker_t* t = admin_tracker_get_or_create_unsafe(ip, now_sec);
+    t->auth_failures = 0;
+    t->lockout_until = 0;
+    pthread_mutex_unlock(&g_admin_tracker_lock);
+}
+
 static void release_conn_slot(uint32_t conn_idx, bool rollback_total) {
     pthread_mutex_lock(&g_state.stats_lock);
     if (conn_idx < SPF_MAX_CONNECTIONS && g_state.connections[conn_idx].active) {
@@ -381,6 +788,82 @@ static int forward_buffer(session_t* s, bool to_target, spf_bucket_t* bucket,
     return off == len ? 0 : -1;
 }
 
+static bool tls_verify_backend(spf_backend_t* backend, SSL* ssl) {
+    if (!backend || !ssl || !backend->tls_verify) {
+        return true;
+    }
+
+    long verify = SSL_get_verify_result(ssl);
+    if (verify != X509_V_OK) {
+        spf_log(SPF_LOG_ERROR, "backend tls verify failed: %ld", verify);
+        return false;
+    }
+
+    const char* name = backend->tls_server_name[0] ? backend->tls_server_name : backend->host;
+    if (tls_verify_peer_name(ssl, name) != 0) {
+        spf_log(SPF_LOG_ERROR, "backend tls hostname verify failed for %s", name);
+        return false;
+    }
+
+    if (backend->tls_pin_enabled && backend->tls_pin_sha256[0]) {
+        if (tls_verify_peer_pin_sha256(ssl, backend->tls_pin_sha256) != 0) {
+            spf_log(SPF_LOG_ERROR, "backend tls pin verify failed");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int dial_backend_socket(spf_backend_t* backend, struct sockaddr_in* tgt_addr, SSL** out_ssl) {
+    if (!backend || !tgt_addr || !out_ssl) {
+        return -1;
+    }
+
+    *out_ssl = NULL;
+
+    int tgt_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (tgt_fd < 0) {
+        return -1;
+    }
+
+    struct timeval tv_conn = {5, 0};
+    setsockopt(tgt_fd, SOL_SOCKET, SO_RCVTIMEO, &tv_conn, sizeof(tv_conn));
+    setsockopt(tgt_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_conn, sizeof(tv_conn));
+
+    if (connect(tgt_fd, (struct sockaddr*)tgt_addr, sizeof(*tgt_addr)) < 0) {
+        close(tgt_fd);
+        return -1;
+    }
+
+    if (!backend->tls_enabled) {
+        return tgt_fd;
+    }
+
+    if (backend->tls_verify && backend->tls_ca_path[0]) {
+        if (tls_set_backend_trust(backend->tls_ca_path) != 0) {
+            close(tgt_fd);
+            return -1;
+        }
+    }
+
+    const char* sni = backend->tls_server_name[0] ? backend->tls_server_name : backend->host;
+    SSL* tls = tls_connect(tgt_fd, sni);
+    if (!tls) {
+        close(tgt_fd);
+        return -1;
+    }
+
+    if (!tls_verify_backend(backend, tls)) {
+        tls_close(tls);
+        close(tgt_fd);
+        return -1;
+    }
+
+    *out_ssl = tls;
+    return tgt_fd;
+}
+
 void sig_handler(int sig) {
     (void)sig;
     g_shutdown = 1;
@@ -621,23 +1104,14 @@ void* listener_thread(void* arg) {
         
         spf_backend_t* b = &rule->backends[backend_idx];
         
-        int tgt_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (tgt_fd < 0) {
-            close(cli_fd);
-            continue;
-        }
-        
         struct sockaddr_in tgt_addr = {0};
         tgt_addr.sin_family = AF_INET;
         tgt_addr.sin_port = htons(b->port);
         inet_pton(AF_INET, b->host, &tgt_addr.sin_addr);
-        
-        struct timeval tv_conn = {5, 0};
-        setsockopt(tgt_fd, SOL_SOCKET, SO_RCVTIMEO, &tv_conn, sizeof(tv_conn));
-        setsockopt(tgt_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_conn, sizeof(tv_conn));
-        
-        if (connect(tgt_fd, (struct sockaddr*)&tgt_addr, sizeof(tgt_addr)) < 0) {
-            close(tgt_fd);
+
+        SSL* target_ssl = NULL;
+        int tgt_fd = dial_backend_socket(b, &tgt_addr, &target_ssl);
+        if (tgt_fd < 0) {
             close(cli_fd);
             continue;
         }
@@ -689,6 +1163,7 @@ void* listener_thread(void* arg) {
         sess->rule = rule;
         sess->backend_idx = backend_idx;
         sess->conn_idx = conn_idx;
+        sess->target_ssl = target_ssl;
         
         // Setup TLS
         if (rule->tls_terminate) {
@@ -754,15 +1229,23 @@ static ssize_t ctrl_recv(int fd, SSL* ssl, char* buf, size_t len) {
     return recv(fd, buf, len, 0);
 }
 
-void handle_ctrl(int fd, SSL* ssl) {
+void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
     char buf[SPF_BUFFER_SIZE];
-    bool authed = g_state.config.admin.token[0] == '\0';
+    admin_role_t role = g_state.config.admin.token[0] == '\0' ? ADMIN_ROLE_ADMIN : ADMIN_ROLE_NONE;
+    uint64_t last_activity = spf_time_sec();
+    const char* src_ip = (remote_ip && remote_ip[0]) ? remote_ip : "unknown";
     
     if (!ctrl_send(fd, ssl, "SPF v" SPF_VERSION " Control\n")) return;
-    if (!authed && !ctrl_send(fd, ssl, "AUTH required\n")) return;
+    if (role == ADMIN_ROLE_NONE && !ctrl_send(fd, ssl, "AUTH required\n")) return;
     if (!ctrl_send(fd, ssl, "> ")) return;
     
     while (!g_shutdown) {
+        uint64_t now_sec = spf_time_sec();
+        if (g_state.config.admin.idle_timeout_sec > 0 && (now_sec - last_activity) >= g_state.config.admin.idle_timeout_sec) {
+            ctrl_send(fd, ssl, "ERR idle timeout\n");
+            break;
+        }
+
         ssize_t n = ctrl_recv(fd, ssl, buf, sizeof(buf) - 1);
         if (n < 0) break;
         if (n == 0) {
@@ -772,6 +1255,7 @@ void handle_ctrl(int fd, SSL* ssl) {
             }
             break;
         }
+        last_activity = spf_time_sec();
         buf[n] = '\0';
         
         char* nl = strchr(buf, '\n'); if (nl) *nl = '\0';
@@ -780,28 +1264,89 @@ void handle_ctrl(int fd, SSL* ssl) {
             if (!ctrl_send(fd, ssl, "> ")) break;
             continue;
         }
+
+        spf_ctrl_cmd_kind_t cmd_kind = spf_ctrl_classify_command(buf);
+        const char* cmd_name = ctrl_cmd_name(cmd_kind);
+
+        if (!admin_tracker_allow_cmd(src_ip, spf_time_sec(), g_state.config.admin.max_cmds_per_min)) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.admin_cmd_rate_limited++;
+            pthread_mutex_unlock(&g_state.stats_lock);
+            spf_event_push(&g_state, SPF_EVENT_ADMIN_RATE_LIMIT, src_ip, 0, 0, "admin cmd rate limited");
+            spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "rate limit exceeded");
+            if (!ctrl_send(fd, ssl, "ERR rate limit exceeded\n> ")) {
+                break;
+            }
+            continue;
+        }
         
         char resp[SPF_RES_MAX_LEN] = {0};
         
         if (strncmp(buf, "QUIT", 4) == 0) {
+            spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "ok", "session closed");
             break;
         }
         else if (strncmp(buf, "AUTH ", 5) == 0) {
-            if (spf_verify_token(&g_state, buf + 5)) {
-                authed = true;
-                snprintf(resp, sizeof(resp), "OK authenticated\n");
+            uint32_t lockout_left = 0;
+            if (admin_tracker_locked(src_ip, spf_time_sec(), &lockout_left)) {
+                snprintf(resp, sizeof(resp), "ERR locked for %u sec\n", lockout_left);
             } else {
-                spf_event_push(&g_state, SPF_EVENT_AUTH_FAIL, "", 0, 0, "bad token");
-                snprintf(resp, sizeof(resp), "ERR bad token\n");
+                const char* provided = buf + 5;
+                if (secure_token_equals(g_state.config.admin.token, provided)) {
+                    role = ADMIN_ROLE_ADMIN;
+                    admin_tracker_auth_success(src_ip, spf_time_sec());
+                    snprintf(resp, sizeof(resp), "OK authenticated admin\n");
+                    spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "ok", "authenticated admin");
+                } else if (secure_token_equals(g_state.config.admin.readonly_token, provided)) {
+                    role = ADMIN_ROLE_READONLY;
+                    admin_tracker_auth_success(src_ip, spf_time_sec());
+                    snprintf(resp, sizeof(resp), "OK authenticated readonly\n");
+                    spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "ok", "authenticated readonly");
+                } else {
+                    uint32_t lockout_for = 0;
+                    bool locked = admin_tracker_auth_fail(
+                        src_ip,
+                        spf_time_sec(),
+                        g_state.config.admin.auth_fail_threshold,
+                        g_state.config.admin.auth_lockout_sec,
+                        &lockout_for);
+
+                    pthread_mutex_lock(&g_state.stats_lock);
+                    g_state.admin_auth_failures++;
+                    if (locked) {
+                        g_state.admin_lockouts++;
+                    }
+                    pthread_mutex_unlock(&g_state.stats_lock);
+
+                    spf_event_push(&g_state, SPF_EVENT_AUTH_FAIL, src_ip, 0, 0, "bad admin token");
+                    if (locked) {
+                        spf_event_push(&g_state, SPF_EVENT_ADMIN_LOCKOUT, src_ip, 0, 0, "admin locked due to auth failures");
+                        snprintf(resp, sizeof(resp), "ERR bad token; locked %u sec\n", lockout_for);
+                        spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "bad token lockout");
+                    } else {
+                        snprintf(resp, sizeof(resp), "ERR bad token\n");
+                        spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "bad token");
+                    }
+                }
             }
         }
-        else if (!authed) {
+        else if (role == ADMIN_ROLE_NONE) {
             snprintf(resp, sizeof(resp), "ERR auth required\n");
+            spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "auth required");
+        }
+        else if ((role == ADMIN_ROLE_READONLY ||
+                  (g_state.config.admin.read_only_mode &&
+                   strncmp(buf, "READONLY OFF", 12) != 0 &&
+                   strncmp(buf, "ROLLBACK", 8) != 0)) &&
+                 is_write_command(buf)) {
+            snprintf(resp, sizeof(resp), "ERR readonly session\n");
+            spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "readonly session");
         }
         else if (strncmp(buf, "HELP", 4) == 0) {
             snprintf(resp, sizeof(resp),
                 "Commands:\n"
                 "  AUTH <token>       - authenticate\n"
+                "  AUTH <readonly_token> - readonly authenticate\n"
                 "  STATUS             - system stats\n"
                 "  RULES              - list rules\n"
                 "  BACKENDS <id>      - show backends\n"
@@ -819,10 +1364,15 @@ void handle_ctrl(int fd, SSL* ssl) {
                 "  SAVE               - save runtime config\n"
                 "  RELOAD             - reload config from disk\n"
                 "  HEALTH <id>        - backend health snapshot\n"
+                "  READONLY ON|OFF    - toggle global readonly mode\n"
+                "  STAGE <k> <v>      - stage admin config change\n"
+                "  APPLY              - apply staged admin changes\n"
+                "  ROLLBACK           - rollback last APPLY\n"
                 "  BLOCK <ip> [sec]   - block ip\n"
                 "  UNBLOCK <ip>       - unblock ip\n"
                 "  LOGS [n]           - recent events\n"
                 "  METRICS            - prometheus\n"
+                "  TLSINFO            - tls control plane details\n"
                 "  QUIT               - close\n");
         }
         else if (strncmp(buf, "STATUS", 6) == 0) {
@@ -836,7 +1386,12 @@ void handle_ctrl(int fd, SSL* ssl) {
                 "Bytes In: %lu\n"
                 "Bytes Out: %lu\n"
                 "Rules: %u\n"
-                "Blocked IPs: %lu\n",
+                "Blocked IPs: %lu\n"
+                "Staged Changes: %u\n"
+                "Admin Auth Fails: %lu\n"
+                "Admin Lockouts: %lu\n"
+                "Admin Cmd Rate Limited: %lu\n"
+                "Session Role: %s\n",
                 SPF_VERSION,
                 up/3600, (up%3600)/60, up%60,
                 g_state.active_conns,
@@ -844,7 +1399,12 @@ void handle_ctrl(int fd, SSL* ssl) {
                 g_state.total_bytes_in,
                 g_state.total_bytes_out,
                 g_state.rule_count,
-                g_state.blocked_count);
+                g_state.blocked_count,
+                g_state.staged_change_count,
+                g_state.admin_auth_failures,
+                g_state.admin_lockouts,
+                g_state.admin_cmd_rate_limited,
+                role == ADMIN_ROLE_ADMIN ? "admin" : (role == ADMIN_ROLE_READONLY ? "readonly" : "none"));
         }
         else if (strncmp(buf, "RULES", 5) == 0) {
             char* p = resp;
@@ -860,7 +1420,7 @@ void handle_ctrl(int fd, SSL* ssl) {
         }
         else if (strncmp(buf, "BACKENDS ", 9) == 0) {
             uint32_t id;
-            if (sscanf(buf + 9, "%u", &id) == 1) {
+            if (parse_u32_strict(buf + 9, &id)) {
                 spf_rule_t* r = spf_get_rule(&g_state, id);
                 if (r) {
                     char* p = resp;
@@ -946,7 +1506,7 @@ void handle_ctrl(int fd, SSL* ssl) {
         }
         else if (strncmp(buf, "DEL ", 4) == 0) {
             uint32_t id;
-            if (sscanf(buf + 4, "%u", &id) == 1) {
+            if (parse_u32_strict(buf + 4, &id)) {
                 if (spf_del_rule(&g_state, id) == 0) {
                     snprintf(resp, sizeof(resp), "OK deleted\n");
                 } else {
@@ -956,7 +1516,7 @@ void handle_ctrl(int fd, SSL* ssl) {
         }
         else if (strncmp(buf, "PAUSE ", 6) == 0) {
             uint32_t id;
-            if (sscanf(buf + 6, "%u", &id) == 1) {
+            if (parse_u32_strict(buf + 6, &id)) {
                 spf_rule_t* r = spf_get_rule(&g_state, id);
                 if (!r) {
                     snprintf(resp, sizeof(resp), "ERR rule not found\n");
@@ -972,7 +1532,7 @@ void handle_ctrl(int fd, SSL* ssl) {
         }
         else if (strncmp(buf, "RESUME ", 7) == 0) {
             uint32_t id;
-            if (sscanf(buf + 7, "%u", &id) == 1) {
+            if (parse_u32_strict(buf + 7, &id)) {
                 spf_rule_t* r = spf_get_rule(&g_state, id);
                 if (!r) {
                     snprintf(resp, sizeof(resp), "ERR rule not found\n");
@@ -989,9 +1549,14 @@ void handle_ctrl(int fd, SSL* ssl) {
         else if (strncmp(buf, "DRAIN ", 6) == 0) {
             uint32_t id;
             char idx_str[16] = {0};
+            char timeout_str[32] = {0};
             uint32_t timeout = 30;
-            int parsed = sscanf(buf + 6, "%u %15s %u", &id, idx_str, &timeout);
+            int parsed = sscanf(buf + 6, "%u %15s %31s", &id, idx_str, timeout_str);
             if (parsed >= 2) {
+                if (parsed == 3 && !parse_u32_strict(timeout_str, &timeout)) {
+                    snprintf(resp, sizeof(resp), "ERR invalid timeout\n");
+                    goto send_resp;
+                }
                 spf_rule_t* r = spf_get_rule(&g_state, id);
                 uint8_t idx = 0;
                 if (!r) {
@@ -1014,9 +1579,16 @@ void handle_ctrl(int fd, SSL* ssl) {
         else if (strncmp(buf, "SETWEIGHT ", 10) == 0) {
             uint32_t id;
             char idx_str[16] = {0};
+            char weight_str[16] = {0};
             uint16_t weight = 0;
-            int parsed = sscanf(buf + 10, "%u %15s %hu", &id, idx_str, &weight);
+            int parsed = sscanf(buf + 10, "%u %15s %15s", &id, idx_str, weight_str);
             if (parsed == 3) {
+                uint32_t weight_u32 = 0;
+                if (!parse_u32_strict(weight_str, &weight_u32) || weight_u32 == 0 || weight_u32 > UINT16_MAX) {
+                    snprintf(resp, sizeof(resp), "ERR invalid weight\n");
+                    goto send_resp;
+                }
+                weight = (uint16_t)weight_u32;
                 spf_rule_t* r = spf_get_rule(&g_state, id);
                 uint8_t idx = 0;
                 if (!r) {
@@ -1118,7 +1690,7 @@ void handle_ctrl(int fd, SSL* ssl) {
         }
         else if (strncmp(buf, "HEALTH ", 7) == 0) {
             uint32_t id;
-            if (sscanf(buf + 7, "%u", &id) == 1) {
+            if (parse_u32_strict(buf + 7, &id)) {
                 spf_rule_t* r = spf_get_rule(&g_state, id);
                 if (!r) {
                     snprintf(resp, sizeof(resp), "ERR rule not found\n");
@@ -1142,11 +1714,91 @@ void handle_ctrl(int fd, SSL* ssl) {
                 snprintf(resp, sizeof(resp), "ERR usage: HEALTH <id>\n");
             }
         }
+        else if (strncmp(buf, "READONLY ", 9) == 0) {
+            if (strncmp(buf + 9, "ON", 2) == 0) {
+                g_state.config.admin.read_only_mode = true;
+                snprintf(resp, sizeof(resp), "OK readonly enabled\n");
+            } else if (strncmp(buf + 9, "OFF", 3) == 0) {
+                g_state.config.admin.read_only_mode = false;
+                snprintf(resp, sizeof(resp), "OK readonly disabled\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: READONLY ON|OFF\n");
+            }
+        }
+        else if (strncmp(buf, "STAGE ", 6) == 0) {
+            char key[64] = {0};
+            char value[256] = {0};
+            if (sscanf(buf + 6, "%63s %255[^\n]", key, value) == 2) {
+                int rc = stage_config_change(key, value);
+                if (rc == 0) {
+                    snprintf(resp, sizeof(resp), "OK staged %s\n", key);
+                } else if (rc == -2) {
+                    snprintf(resp, sizeof(resp), "ERR stage full\n");
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR invalid staged key/value\n");
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: STAGE <key> <value>\n");
+            }
+        }
+        else if (strncmp(buf, "STAGE", 5) == 0) {
+            pthread_mutex_lock(&g_state.lock);
+            uint32_t staged = g_state.staged_change_count;
+            pthread_mutex_unlock(&g_state.lock);
+            snprintf(resp, sizeof(resp), "staged_changes=%u\n", staged);
+        }
+        else if (strncmp(buf, "APPLY", 5) == 0) {
+            int rc = apply_staged_changes();
+            if (rc == 0) {
+                snprintf(resp, sizeof(resp), "OK applied staged config\n");
+            } else if (rc == 1) {
+                snprintf(resp, sizeof(resp), "ERR no staged config\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR failed to apply staged config\n");
+            }
+        }
+        else if (strncmp(buf, "ROLLBACK", 8) == 0) {
+            int rc = rollback_last_admin_apply();
+            if (rc == 0) {
+                snprintf(resp, sizeof(resp), "OK rolled back\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR no snapshot to rollback\n");
+            }
+        }
+        else if (strncmp(buf, "TLSINFO", 7) == 0) {
+            snprintf(resp, sizeof(resp),
+                "--- TLS INFO ---\n"
+                "tls_enabled=%s\n"
+                "mtls_required=%s\n"
+                "ca_loaded=%s\n"
+                "readonly_mode=%s\n"
+                "max_cmds_per_min=%u\n"
+                "auth_fail_threshold=%u\n"
+                "auth_lockout_sec=%u\n"
+                "idle_timeout_sec=%u\n"
+                "audit_log=%s\n"
+                "staged_changes=%u\n",
+                g_state.config.admin.tls_enabled ? "true" : "false",
+                g_state.config.admin.require_client_cert ? "true" : "false",
+                g_state.config.admin.ca_path[0] ? "true" : "false",
+                g_state.config.admin.read_only_mode ? "true" : "false",
+                g_state.config.admin.max_cmds_per_min,
+                g_state.config.admin.auth_fail_threshold,
+                g_state.config.admin.auth_lockout_sec,
+                g_state.config.admin.idle_timeout_sec,
+                g_state.config.admin.audit_log_path[0] ? g_state.config.admin.audit_log_path : "(disabled)",
+                g_state.staged_change_count);
+        }
         else if (strncmp(buf, "BLOCK ", 6) == 0) {
             char ip[64] = {0};
+            char dur_str[32] = {0};
             uint64_t dur = 3600;
-            int parsed = sscanf(buf + 6, "%63s %lu", ip, &dur);
+            int parsed = sscanf(buf + 6, "%63s %31s", ip, dur_str);
             if (parsed >= 1 && ip[0] != '\0') {
+                if (parsed == 2 && !parse_u64_strict(dur_str, &dur)) {
+                    snprintf(resp, sizeof(resp), "ERR invalid duration\n");
+                    goto send_resp;
+                }
                 spf_block_ip(&g_state, ip, dur);
                 snprintf(resp, sizeof(resp), "OK blocked %s for %lu sec\n", ip, dur);
             } else {
@@ -1162,7 +1814,13 @@ void handle_ctrl(int fd, SSL* ssl) {
         }
         else if (strncmp(buf, "LOGS", 4) == 0) {
             uint32_t n = 10;
-            sscanf(buf + 4, "%u", &n);
+            char* arg = buf + 4;
+            while (*arg == ' ') {
+                arg++;
+            }
+            if (*arg != '\0' && !parse_u32_strict(arg, &n)) {
+                n = 10;
+            }
             if (n > 50) n = 50;
             
             spf_event_t events[50];
@@ -1190,6 +1848,12 @@ void handle_ctrl(int fd, SSL* ssl) {
         else {
             snprintf(resp, sizeof(resp), "ERR unknown cmd\n");
         }
+        spf_audit_log(&g_state,
+                      src_ip,
+                      admin_role_str(role),
+                      cmd_name,
+                      strncmp(resp, "OK", 2) == 0 ? "ok" : "err",
+                      resp);
 send_resp:
         if (!ctrl_send(fd, ssl, resp)) break;
         if (!ctrl_send(fd, ssl, "> ")) break;
@@ -1228,10 +1892,11 @@ void* ctrl_thread(void* arg) {
         socklen_t cli_len = sizeof(cli_addr);
         int cli = accept(g_ctrl_fd, (struct sockaddr*)&cli_addr, &cli_len);
         if (cli >= 0) {
+            char remote_ip[SPF_IP_MAX_LEN] = {0};
+            inet_ntop(AF_INET, &cli_addr.sin_addr, remote_ip, sizeof(remote_ip));
+
             if (!is_admin_ip_allowed(&cli_addr)) {
-                char ip[SPF_IP_MAX_LEN] = {0};
-                inet_ntop(AF_INET, &cli_addr.sin_addr, ip, sizeof(ip));
-                spf_log(SPF_LOG_WARN, "admin connection denied by allowlist: %s", ip);
+                spf_log(SPF_LOG_WARN, "admin connection denied by allowlist: %s", remote_ip);
                 close(cli);
                 continue;
             }
@@ -1246,7 +1911,7 @@ void* ctrl_thread(void* arg) {
             }
 
             spf_log(SPF_LOG_INFO, "admin connected");
-            handle_ctrl(cli, admin_ssl);
+            handle_ctrl(cli, admin_ssl, remote_ip);
             spf_log(SPF_LOG_INFO, "admin disconnected");
 
             if (admin_ssl) {
@@ -1290,6 +1955,7 @@ int main(int argc, char** argv) {
         {"admin-bind", required_argument, 0, 'b'},
         {"admin-port", required_argument, 0, 'p'},
         {"token", required_argument, 0, 't'},
+        {"readonly", no_argument, 0, 'r'},
         {"admin-allow", required_argument, 0, 'a'},
         {"mtls", no_argument, 0, 'm'},
         {"ca", required_argument, 0, 'A'},
@@ -1304,7 +1970,7 @@ int main(int argc, char** argv) {
     bool cli_mtls = false;
     bool cli_port_set = false;
     int c;
-    while ((c = getopt_long(argc, argv, "C:b:p:t:a:mA:c:k:dh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "C:b:p:t:ra:mA:c:k:dh", opts, NULL)) != -1) {
         switch (c) {
             case 'C': config_path = optarg; break;
             case 'b': bind_addr = optarg; break;
@@ -1325,6 +1991,7 @@ int main(int argc, char** argv) {
             case 'c': cert = optarg; break;
             case 'k': key = optarg; break;
             case 'd': daemon_mode = true; break;
+            case 'r': g_state.config.admin.read_only_mode = true; break;
             case 'h':
                 printf("SPF v%s - Production Network Forwarder\n\n", SPF_VERSION);
                 printf("Usage: %s [options]\n\n", argv[0]);
@@ -1333,6 +2000,8 @@ int main(int argc, char** argv) {
                 printf("  -b, --admin-bind <ip>  Bind address (default: 127.0.0.1)\n");
                 printf("  -p, --admin-port <n>   Control port (default: 8081)\n");
                 printf("  -t, --token <str>      Auth token (required for remote)\n");
+                printf("  -r, --readonly         Start in readonly admin mode\n");
+                printf("  ENV SPF_READONLY_TOKEN Readonly control token\n");
                 printf("  -a, --admin-allow <ip1,ip2> Admin allowlist\n");
                 printf("  -m, --mtls             Require client TLS certificates\n");
                 printf("  -A, --ca <path>        Client CA bundle for mTLS\n");
@@ -1366,6 +2035,12 @@ int main(int argc, char** argv) {
     if (token) {
         strncpy(g_state.config.admin.token, token, SPF_TOKEN_MAX - 1);
         g_state.config.admin.token[SPF_TOKEN_MAX - 1] = '\0';
+    }
+
+    char* ro_env = getenv("SPF_READONLY_TOKEN");
+    if (ro_env && ro_env[0]) {
+        strncpy(g_state.config.admin.readonly_token, ro_env, SPF_TOKEN_MAX - 1);
+        g_state.config.admin.readonly_token[SPF_TOKEN_MAX - 1] = '\0';
     }
     if (cert) {
         strncpy(g_state.config.admin.cert_path, cert, SPF_PATH_MAX - 1);
@@ -1403,6 +2078,13 @@ int main(int argc, char** argv) {
 
     if (g_state.config.admin.port == SPF_METRICS_PORT_DEFAULT && g_state.config.metrics.enabled) {
         spf_log(SPF_LOG_WARN, "admin and metrics ports overlap on %u", g_state.config.admin.port);
+    }
+
+    apply_admin_security_defaults();
+
+    if (g_state.config.admin.read_only_mode && g_state.config.admin.readonly_token[0] == '\0') {
+        fprintf(stderr, "readonly mode requires readonly_token in config\n");
+        return 1;
     }
     
     const char* tls_cert = g_state.config.admin.cert_path[0] ? g_state.config.admin.cert_path : cert;

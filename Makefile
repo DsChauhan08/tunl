@@ -72,6 +72,14 @@ all: $(BIN_DIR)/$(TARGET)
 debug:
 	@$(MAKE) BUILD_MODE=debug all
 
+asan:
+	@$(MAKE) BUILD_MODE=debug CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=address -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address"
+
+ubsan:
+	@$(MAKE) BUILD_MODE=debug CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=undefined"
+
+sanitizers: asan ubsan
+
 release:
 	@$(MAKE) BUILD_MODE=release all
 
@@ -162,6 +170,11 @@ test-smoke: $(BIN_DIR)/$(TARGET)
 test-cli: $(BIN_DIR)/$(TARGET)
 	@echo "Running real-world CLI tests..."
 	@bash tests/cli_realworld.sh
+
+fuzz-ctrl:
+	@echo "Building control parser fuzz harness..."
+	@clang -g -O1 -fsanitize=fuzzer,address,undefined -I$(SRC_DIR) tests/fuzz_ctrl_parser.c src/core.c -o bin/fuzz_ctrl_parser -lssl -lcrypto -lpthread -lrt
+	@echo "Built bin/fuzz_ctrl_parser"
 
 clean:
 	@rm -rf $(BUILD_DIR) $(BIN_DIR)

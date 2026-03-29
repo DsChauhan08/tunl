@@ -3,10 +3,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <openssl/sha.h>
 
 #ifdef SPF_PLATFORM_ESP32
     #include <Arduino.h>
@@ -81,6 +83,150 @@ void spf_log(spf_log_level_t level, const char* fmt, ...) {
     fprintf(stderr, "\n");
 }
 
+spf_ctrl_cmd_kind_t spf_ctrl_classify_command(const char* line) {
+    if (!line || !*line) return SPF_CTRL_CMD_UNKNOWN;
+    if (strncmp(line, "AUTH ", 5) == 0) return SPF_CTRL_CMD_AUTH;
+    if (strncmp(line, "STATUS", 6) == 0) return SPF_CTRL_CMD_STATUS;
+    if (strncmp(line, "RULES", 5) == 0) return SPF_CTRL_CMD_RULES;
+    if (strncmp(line, "BACKENDS ", 9) == 0) return SPF_CTRL_CMD_BACKENDS;
+    if (strncmp(line, "ADD ", 4) == 0) return SPF_CTRL_CMD_ADD;
+    if (strncmp(line, "DEL ", 4) == 0) return SPF_CTRL_CMD_DEL;
+    if (strncmp(line, "PAUSE ", 6) == 0) return SPF_CTRL_CMD_PAUSE;
+    if (strncmp(line, "RESUME ", 7) == 0) return SPF_CTRL_CMD_RESUME;
+    if (strncmp(line, "DRAIN ", 6) == 0) return SPF_CTRL_CMD_DRAIN;
+    if (strncmp(line, "SETWEIGHT ", 10) == 0) return SPF_CTRL_CMD_SETWEIGHT;
+    if (strncmp(line, "SETSTATE ", 9) == 0) return SPF_CTRL_CMD_SETSTATE;
+    if (strncmp(line, "ADMINALLOWLIST", 14) == 0) return SPF_CTRL_CMD_ADMINALLOWLIST;
+    if (strncmp(line, "ADMINALLOW ", 11) == 0) return SPF_CTRL_CMD_ADMINALLOW;
+    if (strncmp(line, "ADMINDENY ", 10) == 0) return SPF_CTRL_CMD_ADMINDENY;
+    if (strncmp(line, "ADMINSET ", 9) == 0) return SPF_CTRL_CMD_ADMINSET;
+    if (strncmp(line, "SAVE", 4) == 0) return SPF_CTRL_CMD_SAVE;
+    if (strncmp(line, "RELOAD", 6) == 0) return SPF_CTRL_CMD_RELOAD;
+    if (strncmp(line, "HEALTH ", 7) == 0) return SPF_CTRL_CMD_HEALTH;
+    if (strncmp(line, "READONLY ", 9) == 0) return SPF_CTRL_CMD_READONLY;
+    if (strncmp(line, "BLOCK ", 6) == 0) return SPF_CTRL_CMD_BLOCK;
+    if (strncmp(line, "UNBLOCK ", 8) == 0) return SPF_CTRL_CMD_UNBLOCK;
+    if (strncmp(line, "LOGS", 4) == 0) return SPF_CTRL_CMD_LOGS;
+    if (strncmp(line, "METRICS", 7) == 0) return SPF_CTRL_CMD_METRICS;
+    if (strncmp(line, "TLSINFO", 7) == 0) return SPF_CTRL_CMD_TLSINFO;
+    if (strncmp(line, "STAGE ", 6) == 0) return SPF_CTRL_CMD_STAGE;
+    if (strncmp(line, "APPLY", 5) == 0) return SPF_CTRL_CMD_APPLY;
+    if (strncmp(line, "ROLLBACK", 8) == 0) return SPF_CTRL_CMD_ROLLBACK;
+    if (strncmp(line, "QUIT", 4) == 0) return SPF_CTRL_CMD_QUIT;
+    if (strncmp(line, "HELP", 4) == 0) return SPF_CTRL_CMD_HELP;
+    return SPF_CTRL_CMD_UNKNOWN;
+}
+
+static void audit_json_escape(const char* in, char* out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return;
+    }
+    if (!in) {
+        out[0] = '\0';
+        return;
+    }
+
+    size_t j = 0;
+    for (size_t i = 0; in[i] != '\0' && j + 2 < out_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '\\' || c == '"') {
+            if (j + 2 >= out_len) break;
+            out[j++] = '\\';
+            out[j++] = (char)c;
+        } else if (c == '\n') {
+            if (j + 2 >= out_len) break;
+            out[j++] = '\\';
+            out[j++] = 'n';
+        } else if (c == '\r') {
+            if (j + 2 >= out_len) break;
+            out[j++] = '\\';
+            out[j++] = 'r';
+        } else if (c == '\t') {
+            if (j + 2 >= out_len) break;
+            out[j++] = '\\';
+            out[j++] = 't';
+        } else if (c < 0x20) {
+            if (j + 6 >= out_len) break;
+            int n = snprintf(out + j, out_len - j, "\\u%04x", c);
+            if (n <= 0) break;
+            j += (size_t)n;
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    out[j] = '\0';
+}
+
+int spf_audit_init(spf_state_t* state) {
+    if (!state) return -1;
+    pthread_mutex_lock(&state->audit_lock);
+    state->audit_seq = 0;
+    strncpy(state->audit_prev_hash,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            sizeof(state->audit_prev_hash) - 1);
+    state->audit_prev_hash[sizeof(state->audit_prev_hash) - 1] = '\0';
+    pthread_mutex_unlock(&state->audit_lock);
+    return 0;
+}
+
+void spf_audit_log(spf_state_t* state, const char* actor_ip, const char* role,
+                   const char* action, const char* result, const char* details) {
+    if (!state || !state->config.admin.audit_log_path[0]) {
+        return;
+    }
+
+    char ip_esc[SPF_IP_MAX_LEN * 2];
+    char role_esc[64];
+    char action_esc[96];
+    char result_esc[64];
+    char details_esc[512];
+    audit_json_escape(actor_ip ? actor_ip : "unknown", ip_esc, sizeof(ip_esc));
+    audit_json_escape(role ? role : "none", role_esc, sizeof(role_esc));
+    audit_json_escape(action ? action : "unknown", action_esc, sizeof(action_esc));
+    audit_json_escape(result ? result : "unknown", result_esc, sizeof(result_esc));
+    audit_json_escape(details ? details : "", details_esc, sizeof(details_esc));
+
+    pthread_mutex_lock(&state->audit_lock);
+    uint64_t seq = ++state->audit_seq;
+    uint64_t ts = spf_time_sec();
+    char prev_hash[65];
+    strncpy(prev_hash, state->audit_prev_hash, sizeof(prev_hash) - 1);
+    prev_hash[sizeof(prev_hash) - 1] = '\0';
+
+    char canonical[1536];
+    int n = snprintf(canonical, sizeof(canonical),
+                     "{\"seq\":%" PRIu64 ",\"ts\":%" PRIu64 ",\"actor_ip\":\"%s\",\"role\":\"%s\",\"action\":\"%s\",\"result\":\"%s\",\"details\":\"%s\",\"prev_hash\":\"%s\"}",
+                     seq, ts, ip_esc, role_esc, action_esc, result_esc, details_esc, prev_hash);
+
+    if (n <= 0 || (size_t)n >= sizeof(canonical)) {
+        pthread_mutex_unlock(&state->audit_lock);
+        return;
+    }
+
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char*)canonical, (size_t)n, digest);
+    char hash_hex[65];
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        snprintf(hash_hex + i * 2, 3, "%02x", digest[i]);
+    }
+    hash_hex[64] = '\0';
+
+    FILE* f = fopen(state->config.admin.audit_log_path, "a");
+    if (!f) {
+        pthread_mutex_unlock(&state->audit_lock);
+        return;
+    }
+
+    fprintf(f,
+            "{\"seq\":%" PRIu64 ",\"ts\":%" PRIu64 ",\"actor_ip\":\"%s\",\"role\":\"%s\",\"action\":\"%s\",\"result\":\"%s\",\"details\":\"%s\",\"prev_hash\":\"%s\",\"hash\":\"%s\"}\n",
+            seq, ts, ip_esc, role_esc, action_esc, result_esc, details_esc, prev_hash, hash_hex);
+    fclose(f);
+
+    strncpy(state->audit_prev_hash, hash_hex, sizeof(state->audit_prev_hash) - 1);
+    state->audit_prev_hash[sizeof(state->audit_prev_hash) - 1] = '\0';
+    pthread_mutex_unlock(&state->audit_lock);
+}
+
 void spf_init(spf_state_t* state) {
     memset(state, 0, sizeof(spf_state_t));
     state->running = true;
@@ -90,13 +236,24 @@ void spf_init(spf_state_t* state) {
     
     pthread_mutex_init(&state->lock, NULL);
     pthread_mutex_init(&state->stats_lock, NULL);
+    pthread_mutex_init(&state->audit_lock, NULL);
     pthread_mutex_init(&state->events.lock, NULL);
     pthread_rwlock_init(&state->blocklist.lock, NULL);
     
     strncpy(state->config.admin.bind_addr, "127.0.0.1", SPF_IP_MAX_LEN);
     state->config.admin.port = SPF_CTRL_PORT_DEFAULT;
+    state->config.admin.max_cmds_per_min = 240;
+    state->config.admin.auth_fail_threshold = 5;
+    state->config.admin.auth_lockout_sec = 300;
+    state->config.admin.idle_timeout_sec = 300;
+    strncpy(state->config.admin.audit_log_path, "spf_audit.log", SPF_PATH_MAX - 1);
+    state->config.admin.audit_log_path[SPF_PATH_MAX - 1] = '\0';
     state->config.metrics.port = SPF_METRICS_PORT_DEFAULT;
     state->config.log_level = SPF_LOG_INFO;
+    state->staged_change_count = 0;
+    state->has_admin_snapshot = false;
+
+    spf_audit_init(state);
     
     spf_log(SPF_LOG_INFO, "spf v%s init done", SPF_VERSION);
 }
@@ -106,6 +263,7 @@ void spf_shutdown(spf_state_t* state) {
     
     pthread_mutex_destroy(&state->lock);
     pthread_mutex_destroy(&state->stats_lock);
+    pthread_mutex_destroy(&state->audit_lock);
     pthread_mutex_destroy(&state->events.lock);
     pthread_rwlock_destroy(&state->blocklist.lock);
     
