@@ -148,6 +148,9 @@ int spf_load_config(spf_state_t* state, const char* path) {
             } else if (strcmp(key, "token") == 0) {
                 strncpy(state->config.admin.token, val, SPF_TOKEN_MAX - 1);
                 state->config.admin.token[SPF_TOKEN_MAX - 1] = '\0';
+            } else if (strcmp(key, "readonly_token") == 0) {
+                strncpy(state->config.admin.readonly_token, val, SPF_TOKEN_MAX - 1);
+                state->config.admin.readonly_token[SPF_TOKEN_MAX - 1] = '\0';
             } else if (strcmp(key, "cert") == 0) {
                 strncpy(state->config.admin.cert_path, val, SPF_PATH_MAX - 1);
                 state->config.admin.cert_path[SPF_PATH_MAX - 1] = '\0';
@@ -161,8 +164,43 @@ int spf_load_config(spf_state_t* state, const char* path) {
                 state->config.admin.tls_enabled = strcmp(val, "true") == 0;
             } else if (strcmp(key, "mtls") == 0) {
                 state->config.admin.require_client_cert = strcmp(val, "true") == 0;
+            } else if (strcmp(key, "readonly") == 0) {
+                state->config.admin.read_only_mode = strcmp(val, "true") == 0;
             } else if (strcmp(key, "allowlist") == 0) {
                 parse_admin_allowlist(&state->config.admin, val);
+            } else if (strcmp(key, "max_cmds_per_min") == 0) {
+                uint32_t v = 0;
+                if (parse_u32_value(val, &v)) {
+                    state->config.admin.max_cmds_per_min = v;
+                }
+            } else if (strcmp(key, "auth_fail_threshold") == 0) {
+                uint32_t v = 0;
+                if (parse_u32_value(val, &v)) {
+                    state->config.admin.auth_fail_threshold = v;
+                }
+            } else if (strcmp(key, "auth_lockout_sec") == 0) {
+                uint32_t v = 0;
+                if (parse_u32_value(val, &v)) {
+                    state->config.admin.auth_lockout_sec = v;
+                }
+            } else if (strcmp(key, "idle_timeout_sec") == 0) {
+                uint32_t v = 0;
+                if (parse_u32_value(val, &v)) {
+                    state->config.admin.idle_timeout_sec = v;
+                }
+            } else if (strcmp(key, "service_token_max_ttl_sec") == 0) {
+                uint32_t v = 0;
+                if (parse_u32_value(val, &v)) {
+                    state->config.admin.service_token_max_ttl_sec = v;
+                }
+            } else if (strcmp(key, "temp_grant_max_ttl_sec") == 0) {
+                uint32_t v = 0;
+                if (parse_u32_value(val, &v)) {
+                    state->config.admin.temp_grant_max_ttl_sec = v;
+                }
+            } else if (strcmp(key, "audit_log") == 0) {
+                strncpy(state->config.admin.audit_log_path, val, SPF_PATH_MAX - 1);
+                state->config.admin.audit_log_path[SPF_PATH_MAX - 1] = '\0';
             }
         }
         else if (strcmp(section, "security") == 0) {
@@ -240,6 +278,28 @@ int spf_load_config(spf_state_t* state, const char* path) {
                     current_rule->backend_count++;
                 }
             }
+            else if (strcmp(key, "backend_tls") == 0 && current_rule && current_rule->backend_count > 0) {
+                current_rule->backends[current_rule->backend_count - 1].tls_enabled = strcmp(val, "true") == 0;
+            }
+            else if (strcmp(key, "backend_tls_verify") == 0 && current_rule && current_rule->backend_count > 0) {
+                current_rule->backends[current_rule->backend_count - 1].tls_verify = strcmp(val, "true") == 0;
+            }
+            else if (strcmp(key, "backend_tls_sni") == 0 && current_rule && current_rule->backend_count > 0) {
+                spf_backend_t* b = &current_rule->backends[current_rule->backend_count - 1];
+                strncpy(b->tls_server_name, val, sizeof(b->tls_server_name) - 1);
+                b->tls_server_name[sizeof(b->tls_server_name) - 1] = '\0';
+            }
+            else if (strcmp(key, "backend_tls_ca") == 0 && current_rule && current_rule->backend_count > 0) {
+                spf_backend_t* b = &current_rule->backends[current_rule->backend_count - 1];
+                strncpy(b->tls_ca_path, val, sizeof(b->tls_ca_path) - 1);
+                b->tls_ca_path[sizeof(b->tls_ca_path) - 1] = '\0';
+            }
+            else if (strcmp(key, "backend_tls_pin_sha256") == 0 && current_rule && current_rule->backend_count > 0) {
+                spf_backend_t* b = &current_rule->backends[current_rule->backend_count - 1];
+                strncpy(b->tls_pin_sha256, val, sizeof(b->tls_pin_sha256) - 1);
+                b->tls_pin_sha256[sizeof(b->tls_pin_sha256) - 1] = '\0';
+                b->tls_pin_enabled = true;
+            }
             else if (strcmp(key, "lb") == 0 && current_rule) {
                 if (strcmp(val, "rr") == 0) current_rule->lb_algo = SPF_LB_ROUNDROBIN;
                 else if (strcmp(val, "lc") == 0) current_rule->lb_algo = SPF_LB_LEASTCONN;
@@ -282,8 +342,21 @@ int config_save(spf_state_t* state, const char* path) {
     if (state->config.admin.token[0]) {
         fprintf(f, "token = %s\n", state->config.admin.token);
     }
+    if (state->config.admin.readonly_token[0]) {
+        fprintf(f, "readonly_token = %s\n", state->config.admin.readonly_token);
+    }
     fprintf(f, "tls = %s\n", state->config.admin.tls_enabled ? "true" : "false");
     fprintf(f, "mtls = %s\n", state->config.admin.require_client_cert ? "true" : "false");
+    fprintf(f, "readonly = %s\n", state->config.admin.read_only_mode ? "true" : "false");
+    fprintf(f, "max_cmds_per_min = %u\n", state->config.admin.max_cmds_per_min);
+    fprintf(f, "auth_fail_threshold = %u\n", state->config.admin.auth_fail_threshold);
+    fprintf(f, "auth_lockout_sec = %u\n", state->config.admin.auth_lockout_sec);
+    fprintf(f, "idle_timeout_sec = %u\n", state->config.admin.idle_timeout_sec);
+    fprintf(f, "service_token_max_ttl_sec = %u\n", state->config.admin.service_token_max_ttl_sec);
+    fprintf(f, "temp_grant_max_ttl_sec = %u\n", state->config.admin.temp_grant_max_ttl_sec);
+    if (state->config.admin.audit_log_path[0]) {
+        fprintf(f, "audit_log = %s\n", state->config.admin.audit_log_path);
+    }
     if (state->config.admin.ca_path[0]) {
         fprintf(f, "ca = %s\n", state->config.admin.ca_path);
     }
@@ -321,6 +394,21 @@ int config_save(spf_state_t* state, const char* path) {
             for (int j = 0; j < r->backend_count; j++) {
                 fprintf(f, "backend = %s:%u:%u\n", 
                     r->backends[j].host, r->backends[j].port, r->backends[j].weight);
+                if (r->backends[j].tls_enabled) {
+                    fprintf(f, "backend_tls = true\n");
+                }
+                if (r->backends[j].tls_verify) {
+                    fprintf(f, "backend_tls_verify = true\n");
+                }
+                if (r->backends[j].tls_server_name[0]) {
+                    fprintf(f, "backend_tls_sni = %s\n", r->backends[j].tls_server_name);
+                }
+                if (r->backends[j].tls_ca_path[0]) {
+                    fprintf(f, "backend_tls_ca = %s\n", r->backends[j].tls_ca_path);
+                }
+                if (r->backends[j].tls_pin_enabled && r->backends[j].tls_pin_sha256[0]) {
+                    fprintf(f, "backend_tls_pin_sha256 = %s\n", r->backends[j].tls_pin_sha256);
+                }
             }
             fprintf(f, "\n");
         }

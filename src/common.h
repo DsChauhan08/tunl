@@ -37,6 +37,10 @@
 #define SPF_PATH_MAX 512
 #define SPF_TOKEN_MAX 128
 #define SPF_MAX_ADMIN_ALLOWLIST 32
+#define SPF_MAX_ADMIN_TRACKERS 256
+#define SPF_MAX_STAGED_CHANGES 64
+#define SPF_MAX_SERVICE_TOKENS 128
+#define SPF_MAX_TEMP_ADMIN_GRANTS 128
 
 #define SPF_CTRL_PORT_DEFAULT 8081
 #define SPF_METRICS_PORT_DEFAULT 9100
@@ -75,7 +79,9 @@ typedef enum {
     SPF_EVENT_GEOBLOCK,
     SPF_EVENT_THREAT_MATCH,
     SPF_EVENT_ANOMALY,
-    SPF_EVENT_DDOS
+    SPF_EVENT_DDOS,
+    SPF_EVENT_ADMIN_LOCKOUT,
+    SPF_EVENT_ADMIN_RATE_LIMIT
 } spf_event_type_t;
 
 typedef enum {
@@ -98,6 +104,11 @@ typedef struct {
     uint64_t last_health_check;
     uint8_t health_fails;
     bool tls_enabled;
+    bool tls_verify;
+    bool tls_pin_enabled;
+    char tls_server_name[SPF_IP_MAX_LEN];
+    char tls_ca_path[SPF_PATH_MAX];
+    char tls_pin_sha256[65];
     pthread_mutex_t lock;
 } spf_backend_t;
 
@@ -165,14 +176,49 @@ typedef struct {
     char bind_addr[SPF_IP_MAX_LEN];
     uint16_t port;
     char token[SPF_TOKEN_MAX];
+    char readonly_token[SPF_TOKEN_MAX];
     bool tls_enabled;
     bool require_client_cert;
+    bool read_only_mode;
     char cert_path[SPF_PATH_MAX];
     char key_path[SPF_PATH_MAX];
     char ca_path[SPF_PATH_MAX];
     char allowlist[SPF_MAX_ADMIN_ALLOWLIST][SPF_IP_MAX_LEN];
     uint8_t allowlist_count;
+    uint32_t max_cmds_per_min;
+    uint32_t auth_fail_threshold;
+    uint32_t auth_lockout_sec;
+    uint32_t idle_timeout_sec;
+    uint32_t service_token_max_ttl_sec;
+    uint32_t temp_grant_max_ttl_sec;
+    char audit_log_path[SPF_PATH_MAX];
 } spf_admin_cfg_t;
+
+typedef struct {
+    char key[64];
+    char value[256];
+} spf_staged_change_t;
+
+typedef struct {
+    uint32_t id;
+    char label[64];
+    char token[SPF_TOKEN_MAX];
+    bool read_only;
+    uint32_t max_uses;
+    uint32_t uses;
+    uint64_t created_ts;
+    uint64_t expires_at;
+    uint64_t last_used_ts;
+    char last_used_ip[SPF_IP_MAX_LEN];
+    bool active;
+} spf_service_token_t;
+
+typedef struct {
+    char ip[SPF_IP_MAX_LEN];
+    uint64_t created_ts;
+    uint64_t expires_at;
+    bool active;
+} spf_temp_admin_grant_t;
 
 typedef struct {
     bool enabled;
@@ -231,12 +277,67 @@ typedef struct {
     uint64_t total_bytes_out;
     uint64_t total_conns;
     uint64_t blocked_count;
+    uint64_t admin_auth_failures;
+    uint64_t admin_lockouts;
+    uint64_t admin_cmd_rate_limited;
+    uint64_t admin_service_token_auth_success;
+    uint64_t admin_service_token_auth_fail;
+    uint64_t admin_temp_grants_created;
+    spf_staged_change_t staged_changes[SPF_MAX_STAGED_CHANGES];
+    uint32_t staged_change_count;
+    spf_service_token_t service_tokens[SPF_MAX_SERVICE_TOKENS];
+    uint32_t next_service_token_id;
+    spf_temp_admin_grant_t temp_admin_grants[SPF_MAX_TEMP_ADMIN_GRANTS];
+    spf_admin_cfg_t last_admin_snapshot;
+    bool has_admin_snapshot;
+    char audit_prev_hash[65];
+    uint64_t audit_seq;
     uint64_t start_time;
     volatile bool running;
     bool authenticated;
     pthread_mutex_t lock;
     pthread_mutex_t stats_lock;
+    pthread_mutex_t audit_lock;
 } spf_state_t;
+
+typedef enum {
+    SPF_CTRL_CMD_UNKNOWN = 0,
+    SPF_CTRL_CMD_AUTH,
+    SPF_CTRL_CMD_STATUS,
+    SPF_CTRL_CMD_RULES,
+    SPF_CTRL_CMD_BACKENDS,
+    SPF_CTRL_CMD_ADD,
+    SPF_CTRL_CMD_DEL,
+    SPF_CTRL_CMD_PAUSE,
+    SPF_CTRL_CMD_RESUME,
+    SPF_CTRL_CMD_DRAIN,
+    SPF_CTRL_CMD_SETWEIGHT,
+    SPF_CTRL_CMD_SETSTATE,
+    SPF_CTRL_CMD_ADMINALLOWLIST,
+    SPF_CTRL_CMD_ADMINALLOW,
+    SPF_CTRL_CMD_ADMINDENY,
+    SPF_CTRL_CMD_ADMINSET,
+    SPF_CTRL_CMD_SAVE,
+    SPF_CTRL_CMD_RELOAD,
+    SPF_CTRL_CMD_HEALTH,
+    SPF_CTRL_CMD_READONLY,
+    SPF_CTRL_CMD_BLOCK,
+    SPF_CTRL_CMD_UNBLOCK,
+    SPF_CTRL_CMD_LOGS,
+    SPF_CTRL_CMD_METRICS,
+    SPF_CTRL_CMD_TLSINFO,
+    SPF_CTRL_CMD_TOKENADD,
+    SPF_CTRL_CMD_TOKENLIST,
+    SPF_CTRL_CMD_TOKENDEL,
+    SPF_CTRL_CMD_ACCESSGRANT,
+    SPF_CTRL_CMD_ACCESSGRANTS,
+    SPF_CTRL_CMD_ACCESSREVOKE,
+    SPF_CTRL_CMD_STAGE,
+    SPF_CTRL_CMD_APPLY,
+    SPF_CTRL_CMD_ROLLBACK,
+    SPF_CTRL_CMD_QUIT,
+    SPF_CTRL_CMD_HELP
+} spf_ctrl_cmd_kind_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -273,6 +374,11 @@ void spf_event_get_recent(spf_state_t* state, spf_event_t* out, uint32_t count, 
 int metrics_start(spf_state_t* state);
 void metrics_stop(void);
 int metrics_format(spf_state_t* state, char* buf, size_t len);
+
+spf_ctrl_cmd_kind_t spf_ctrl_classify_command(const char* line);
+int spf_audit_init(spf_state_t* state);
+void spf_audit_log(spf_state_t* state, const char* actor_ip, const char* role,
+                   const char* action, const char* result, const char* details);
 
 int spf_lb_select_backend(spf_rule_t* rule, const char* client_ip);
 void spf_lb_conn_start(spf_rule_t* rule, uint8_t backend_idx);
@@ -311,6 +417,9 @@ void tls_close(SSL* ssl);
 int tls_set_client_cert(const char* cert, const char* key);
 int tls_set_client_ca(const char* ca_path);
 int tls_require_client_cert(void);
+int tls_set_backend_trust(const char* ca_path);
+int tls_verify_peer_name(SSL* ssl, const char* expected_name);
+int tls_verify_peer_pin_sha256(SSL* ssl, const char* expected_hex);
 const char* tls_get_cipher(SSL* ssl);
 const char* tls_get_version(SSL* ssl);
 

@@ -2,6 +2,8 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/x509v3.h>
+#include <openssl/sha.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -21,6 +23,10 @@ int tls_init(const char* cert, const char* key) {
     
     SSL_CTX_set_min_proto_version(g_server_ctx, TLS1_2_VERSION);
     SSL_CTX_set_options(g_server_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+
+    SSL_CTX_set_mode(g_server_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_session_cache_mode(g_server_ctx, SSL_SESS_CACHE_SERVER);
+    SSL_CTX_set_timeout(g_server_ctx, 300);
     
     SSL_CTX_set_cipher_list(g_server_ctx, 
         "ECDHE-ECDSA-AES256-GCM-SHA384:"
@@ -58,6 +64,11 @@ int tls_init(const char* cert, const char* key) {
         return -1;
     }
     SSL_CTX_set_min_proto_version(g_client_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_mode(g_client_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_verify(g_client_ctx, SSL_VERIFY_PEER, NULL);
+    if (SSL_CTX_set_default_verify_paths(g_client_ctx) != 1) {
+        spf_log(SPF_LOG_WARN, "tls: could not load default client trust store");
+    }
     
     spf_log(SPF_LOG_INFO, "tls: initialized");
     return 0;
@@ -187,6 +198,57 @@ int tls_set_client_ca(const char* ca_path) {
 
     spf_log(SPF_LOG_INFO, "tls: loaded client CA bundle");
     return 0;
+}
+
+int tls_set_backend_trust(const char* ca_path) {
+    if (!g_client_ctx || !ca_path || !*ca_path) return -1;
+    if (SSL_CTX_load_verify_locations(g_client_ctx, ca_path, NULL) != 1) {
+        spf_log(SPF_LOG_ERROR, "tls: failed to load backend CA: %s", ca_path);
+        return -1;
+    }
+    SSL_CTX_set_verify(g_client_ctx, SSL_VERIFY_PEER, NULL);
+    return 0;
+}
+
+int tls_verify_peer_name(SSL* ssl, const char* expected_name) {
+    if (!ssl || !expected_name || !*expected_name) return -1;
+    X509* cert = SSL_get_peer_certificate(ssl);
+    if (!cert) {
+        return -1;
+    }
+
+    int ok = X509_check_host(cert, expected_name, 0, 0, NULL);
+    X509_free(cert);
+    return ok == 1 ? 0 : -1;
+}
+
+int tls_verify_peer_pin_sha256(SSL* ssl, const char* expected_hex) {
+    if (!ssl || !expected_hex || strlen(expected_hex) != 64) return -1;
+
+    X509* cert = SSL_get_peer_certificate(ssl);
+    if (!cert) {
+        return -1;
+    }
+
+    unsigned char* der = NULL;
+    int der_len = i2d_X509(cert, &der);
+    if (der_len <= 0) {
+        X509_free(cert);
+        return -1;
+    }
+
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(der, (size_t)der_len, digest);
+    OPENSSL_free(der);
+    X509_free(cert);
+
+    char hex[65];
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    }
+    hex[64] = '\0';
+
+    return strncmp(hex, expected_hex, 64) == 0 ? 0 : -1;
 }
 
 int tls_require_client_cert(void) {

@@ -1,0 +1,55 @@
+name: Sanitizers
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  asan-ubsan:
+    name: ASAN and UBSAN
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libssl-dev python3 netcat-openbsd curl ripgrep
+
+      - name: Build with ASAN
+        run: make clean && make asan
+
+      - name: Run tests under ASAN
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
+        run: make test
+
+      - name: Build with UBSAN
+        run: make clean && make ubsan
+
+      - name: Run tests under UBSAN
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: make test
+
+  fuzz-build:
+    name: Fuzz Harness Build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libssl-dev
+
+      - name: Build control parser fuzz target
+        run: make fuzz-ctrl
+
+      - name: Smoke run fuzz target
+        run: |
+          mkdir -p fuzz-seed
+          printf 'AUTH token\n' > fuzz-seed/seed1
+          ./bin/fuzz_ctrl_parser -runs=100 fuzz-seed

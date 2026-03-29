@@ -30,6 +30,15 @@ bind = 127.0.0.1
 port = 18081
 tls = false
 mtls = false
+readonly = false
+readonly_token = readonly-secret
+max_cmds_per_min = 240
+auth_fail_threshold = 3
+auth_lockout_sec = 3
+idle_timeout_sec = 120
+service_token_max_ttl_sec = 30
+temp_grant_max_ttl_sec = 30
+audit_log = /tmp/spf-cli-audit.log
 allowlist = 127.0.0.1
 
 [metrics]
@@ -43,6 +52,8 @@ bind = 127.0.0.1
 port = 18081
 tls = false
 mtls = false
+readonly = false
+readonly_token = readonly-secret
 allowlist = 127.0.0.1
 
 [metrics]
@@ -57,7 +68,7 @@ BACK_PID=$!
 echo "[cli] starting SPF"
 "$SPF_BIN" --config "$CFG_FILE" --token secret --admin-port 18081 --admin-bind 127.0.0.1 --admin-allow 127.0.0.1 >/tmp/spf-cli.log 2>&1 &
 SPF_PID=$!
-sleep 1
+sleep 5
 
 echo "[cli] creating rule"
 ADMIN_OUT=$( {
@@ -115,5 +126,122 @@ if [[ "$RC" -eq 0 ]]; then
   exit 1
 fi
 rg -q 'Refusing to expose admin control on non-loopback without --token' /tmp/spf-cli-guard.log
+
+echo "[cli] validating readonly token behavior"
+RO_OUT=$( {
+  printf 'AUTH readonly-secret\n'; sleep 0.2
+  printf 'STATUS\n'; sleep 0.2
+  printf 'ADD 19080 127.0.0.1:9000 rr\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$RO_OUT"
+printf '%s\n' "$RO_OUT" | rg -q 'OK authenticated readonly'
+printf '%s\n' "$RO_OUT" | rg -q 'ERR readonly session'
+
+echo "[cli] validating auth lockout behavior"
+LOCK_OUT=$( {
+  printf 'AUTH bad1\n'; sleep 0.2
+  printf 'AUTH bad2\n'; sleep 0.2
+  printf 'AUTH bad3\n'; sleep 0.2
+  printf 'AUTH secret\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$LOCK_OUT"
+printf '%s\n' "$LOCK_OUT" | rg -q 'locked'
+
+sleep 5
+
+echo "[cli] validating TLS info command"
+TLS_OUT=$( {
+  printf 'AUTH readonly-secret\n'; sleep 0.2
+  printf 'TLSINFO\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$TLS_OUT"
+printf '%s\n' "$TLS_OUT" | rg -q 'max_cmds_per_min='
+printf '%s\n' "$TLS_OUT" | rg -q 'auth_fail_threshold='
+printf '%s\n' "$TLS_OUT" | rg -q 'audit_log='
+
+echo "[cli] validating staged apply + rollback"
+DUAL_OUT=$( {
+  printf 'AUTH secret\n'; sleep 0.2
+  printf 'STAGE max_cmds_per_min 123\n'; sleep 0.2
+  printf 'STAGE readonly true\n'; sleep 0.2
+  printf 'APPLY\n'; sleep 0.2
+  printf 'TLSINFO\n'; sleep 0.2
+  printf 'ROLLBACK\n'; sleep 0.2
+  printf 'TLSINFO\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$DUAL_OUT"
+printf '%s\n' "$DUAL_OUT" | rg -q 'OK staged max_cmds_per_min'
+printf '%s\n' "$DUAL_OUT" | rg -q 'OK staged readonly'
+printf '%s\n' "$DUAL_OUT" | rg -q 'OK applied staged config'
+printf '%s\n' "$DUAL_OUT" | rg -q 'max_cmds_per_min=123'
+printf '%s\n' "$DUAL_OUT" | rg -q 'OK rolled back'
+printf '%s\n' "$DUAL_OUT" | rg -q 'max_cmds_per_min=240'
+
+echo "[cli] validating service token auth and temp access grants"
+TOK_OUT=$( {
+  printf 'AUTH secret\n'; sleep 0.2
+  printf 'TOKENADD ci rw 15 2\n'; sleep 0.2
+  printf 'TOKENLIST\n'; sleep 0.2
+  printf 'ACCESSGRANT 127.0.0.2 10\n'; sleep 0.2
+  printf 'ACCESSGRANTS\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$TOK_OUT"
+printf '%s\n' "$TOK_OUT" | rg -q 'OK token id='
+printf '%s\n' "$TOK_OUT" | rg -q -- '--- SERVICE TOKENS ---'
+printf '%s\n' "$TOK_OUT" | rg -q 'OK temp access granted 127.0.0.2'
+printf '%s\n' "$TOK_OUT" | rg -q -- '--- TEMP ACCESS GRANTS ---'
+
+SVC_TOKEN=$(printf '%s\n' "$TOK_OUT" | rg -o 'token=[A-Za-z0-9]+' | sed 's/token=//' | head -n 1)
+if [[ -z "$SVC_TOKEN" ]]; then
+  echo "[cli] failed to parse service token"
+  exit 1
+fi
+
+SVC_AUTH_OUT=$( {
+  printf 'AUTH %s\n' "$SVC_TOKEN"; sleep 0.2
+  printf 'STATUS\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$SVC_AUTH_OUT"
+printf '%s\n' "$SVC_AUTH_OUT" | rg -q 'OK authenticated service token'
+
+TOK_DEL_OUT=$( {
+  printf 'AUTH secret\n'; sleep 0.2
+  printf 'TOKENLIST\n'; sleep 0.2
+  printf 'TOKENDEL 1\n'; sleep 0.2
+  printf 'ACCESSREVOKE 127.0.0.2\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$TOK_DEL_OUT"
+printf '%s\n' "$TOK_DEL_OUT" | rg -q 'token deleted|token not found'
+printf '%s\n' "$TOK_DEL_OUT" | rg -q 'temp access revoked 127.0.0.2'
+
+echo "[cli] validating token metrics surfacing"
+TOK_METRICS=$( {
+  printf 'AUTH secret\n'; sleep 0.2
+  printf 'METRICS\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$TOK_METRICS"
+printf '%s\n' "$TOK_METRICS" | rg -q 'spf_admin_service_token_auth_success_total'
+printf '%s\n' "$TOK_METRICS" | rg -q 'spf_admin_temp_grants_created_total'
+
+echo "[cli] validating audit log entries"
+[[ -f /tmp/spf-cli-audit.log ]]
+rg -q '"prev_hash"' /tmp/spf-cli-audit.log
+rg -q '"hash"' /tmp/spf-cli-audit.log
 
 echo "[cli] real-world CLI checks passed"
