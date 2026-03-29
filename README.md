@@ -155,11 +155,56 @@ make install-deps-arch
 make
 sudo make install
 
+# fedora/rhel/centos
+make install-deps-fedora
+make
+sudo make install
+
+# opensuse
+make install-deps-suse
+make
+sudo make install
+
+# alpine
+make install-deps-alpine
+make
+sudo make install
+
 # macos
 make install-deps-macos
 make
 sudo make install
 ```
+
+## Packaging
+
+SPF ships distro-friendly packaging targets:
+
+```bash
+# local Debian package
+make package-deb VERSION=2.0.0
+
+# local RPM package
+make package-rpm VERSION=2.0.0
+
+# build both
+make package-all VERSION=2.0.0
+```
+
+Install from package:
+
+```bash
+sudo apt install ./spf_2.0.0_amd64.deb
+sudo dnf install ./spf-2.0.0-1.x86_64.rpm
+```
+
+For packagers, `DESTDIR` is supported:
+
+```bash
+make DESTDIR="$(pwd)/build/stage" install
+```
+
+More details: `docs/packaging.md`
 
 ## Control Protocol
 
