@@ -188,6 +188,16 @@ int spf_load_config(spf_state_t* state, const char* path) {
                 if (parse_u32_value(val, &v)) {
                     state->config.admin.idle_timeout_sec = v;
                 }
+            } else if (strcmp(key, "service_token_max_ttl_sec") == 0) {
+                uint32_t v = 0;
+                if (parse_u32_value(val, &v)) {
+                    state->config.admin.service_token_max_ttl_sec = v;
+                }
+            } else if (strcmp(key, "temp_grant_max_ttl_sec") == 0) {
+                uint32_t v = 0;
+                if (parse_u32_value(val, &v)) {
+                    state->config.admin.temp_grant_max_ttl_sec = v;
+                }
             } else if (strcmp(key, "audit_log") == 0) {
                 strncpy(state->config.admin.audit_log_path, val, SPF_PATH_MAX - 1);
                 state->config.admin.audit_log_path[SPF_PATH_MAX - 1] = '\0';
@@ -342,6 +352,8 @@ int config_save(spf_state_t* state, const char* path) {
     fprintf(f, "auth_fail_threshold = %u\n", state->config.admin.auth_fail_threshold);
     fprintf(f, "auth_lockout_sec = %u\n", state->config.admin.auth_lockout_sec);
     fprintf(f, "idle_timeout_sec = %u\n", state->config.admin.idle_timeout_sec);
+    fprintf(f, "service_token_max_ttl_sec = %u\n", state->config.admin.service_token_max_ttl_sec);
+    fprintf(f, "temp_grant_max_ttl_sec = %u\n", state->config.admin.temp_grant_max_ttl_sec);
     if (state->config.admin.audit_log_path[0]) {
         fprintf(f, "audit_log = %s\n", state->config.admin.audit_log_path);
     }

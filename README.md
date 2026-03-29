@@ -186,6 +186,12 @@ READONLY ON|OFF           # toggle global readonly mode
 STAGE <key> <value>       # stage admin config change
 APPLY                     # apply staged admin config changes
 ROLLBACK                  # rollback most recent APPLY
+TOKENADD <label> <ro|rw> <ttl_sec> [max_uses]  # mint scoped service token
+TOKENLIST                 # list active service tokens (without secret)
+TOKENDEL <id>             # revoke service token
+ACCESSGRANT <ip> [ttl]    # temporary allowlist grant for admin plane
+ACCESSGRANTS              # list temporary allowlist grants
+ACCESSREVOKE <ip>         # revoke temporary allowlist grant
 TLSINFO                   # show TLS + admin security posture
 BLOCK <ip> [seconds]      # block IP
 UNBLOCK <ip>              # unblock IP  
@@ -241,7 +247,19 @@ RESUME 12345
 - Admin API supports brute-force lockout and command rate-limits (`auth_fail_threshold`, `auth_lockout_sec`, `max_cmds_per_min`).
 - Admin API supports dual-control flow: `STAGE` -> `APPLY` with `ROLLBACK` safety.
 - Audit events are persisted as JSON lines with `prev_hash` and `hash` for tamper-evident chaining (`admin.audit_log`).
+- Admin API supports short-lived service tokens (`TOKENADD` / `TOKENDEL`) with scoped role (`ro|rw`), TTL, and optional max-uses.
+- Admin API supports temporary just-in-time access grants by source IP (`ACCESSGRANT` / `ACCESSREVOKE`) for least-privilege operations.
+- Admin config supports `service_token_max_ttl_sec` and `temp_grant_max_ttl_sec` to enforce hard caps on temporary credentials.
 - Unknown or invalid allowlist IPs are rejected from CLI and ignored with warnings in config parsing.
+
+### Forum-driven gaps we now address
+
+From self-hosted community pain points (cost/lock-in, repeated MFA prompts, and temporary collaboration access), SPF now includes:
+- **Short-lived machine/service credentials** (service tokens with expiry + use caps).
+- **JIT operator access grants** (temporary IP grants with explicit TTL).
+- **Operator-tunable session windows** via staged config and safer rollback controls.
+
+This gives teams several capabilities typically bundled in paid tunnel/control platforms, while keeping deployment self-hostable.
 
 ## Backend TLS Verification and Pinning
 
@@ -308,6 +326,9 @@ spf_bytes_in_total        # bytes received
 spf_bytes_out_total       # bytes sent
 spf_blocked_total         # blocked IPs
 spf_rules_active          # active rules
+spf_admin_service_token_auth_success_total
+spf_admin_service_token_auth_fail_total
+spf_admin_temp_grants_created_total
 ```
 
 ## ESP32 Support

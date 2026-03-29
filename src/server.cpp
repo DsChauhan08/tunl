@@ -117,6 +117,10 @@ static bool is_write_command(const char* cmd) {
            strncmp(cmd, "ADMINSET ", 9) == 0 ||
            strncmp(cmd, "BLOCK ", 6) == 0 ||
            strncmp(cmd, "UNBLOCK ", 8) == 0 ||
+           strncmp(cmd, "TOKENADD ", 9) == 0 ||
+           strncmp(cmd, "TOKENDEL ", 9) == 0 ||
+           strncmp(cmd, "ACCESSGRANT ", 12) == 0 ||
+           strncmp(cmd, "ACCESSREVOKE ", 13) == 0 ||
            strncmp(cmd, "STAGE ", 6) == 0 ||
            strncmp(cmd, "APPLY", 5) == 0 ||
            strncmp(cmd, "ROLLBACK", 8) == 0 ||
@@ -156,6 +160,12 @@ static const char* ctrl_cmd_name(spf_ctrl_cmd_kind_t kind) {
         case SPF_CTRL_CMD_LOGS: return "LOGS";
         case SPF_CTRL_CMD_METRICS: return "METRICS";
         case SPF_CTRL_CMD_TLSINFO: return "TLSINFO";
+        case SPF_CTRL_CMD_TOKENADD: return "TOKENADD";
+        case SPF_CTRL_CMD_TOKENLIST: return "TOKENLIST";
+        case SPF_CTRL_CMD_TOKENDEL: return "TOKENDEL";
+        case SPF_CTRL_CMD_ACCESSGRANT: return "ACCESSGRANT";
+        case SPF_CTRL_CMD_ACCESSGRANTS: return "ACCESSGRANTS";
+        case SPF_CTRL_CMD_ACCESSREVOKE: return "ACCESSREVOKE";
         case SPF_CTRL_CMD_STAGE: return "STAGE";
         case SPF_CTRL_CMD_APPLY: return "APPLY";
         case SPF_CTRL_CMD_ROLLBACK: return "ROLLBACK";
@@ -172,6 +182,8 @@ static bool staged_admin_key_allowed(const char* key) {
         strcmp(key, "auth_fail_threshold") == 0 ||
         strcmp(key, "auth_lockout_sec") == 0 ||
         strcmp(key, "idle_timeout_sec") == 0 ||
+        strcmp(key, "service_token_max_ttl_sec") == 0 ||
+        strcmp(key, "temp_grant_max_ttl_sec") == 0 ||
         strcmp(key, "allowlist") == 0 ||
         strcmp(key, "audit_log") == 0
     );
@@ -253,6 +265,22 @@ static int apply_staged_changes(void) {
                 return -1;
             }
             g_state.config.admin.idle_timeout_sec = v;
+        } else if (strcmp(key, "service_token_max_ttl_sec") == 0) {
+            uint32_t v = 0;
+            if (!parse_u32_strict(val, &v)) {
+                g_state.config.admin = g_state.last_admin_snapshot;
+                pthread_mutex_unlock(&g_state.lock);
+                return -1;
+            }
+            g_state.config.admin.service_token_max_ttl_sec = v;
+        } else if (strcmp(key, "temp_grant_max_ttl_sec") == 0) {
+            uint32_t v = 0;
+            if (!parse_u32_strict(val, &v)) {
+                g_state.config.admin = g_state.last_admin_snapshot;
+                pthread_mutex_unlock(&g_state.lock);
+                return -1;
+            }
+            g_state.config.admin.temp_grant_max_ttl_sec = v;
         } else if (strcmp(key, "allowlist") == 0) {
             char parsed[SPF_MAX_ADMIN_ALLOWLIST][SPF_IP_MAX_LEN];
             uint8_t count = 0;
@@ -320,6 +348,240 @@ static int rollback_last_admin_apply(void) {
     return 0;
 }
 
+static int service_token_add(const char* label, bool read_only, uint32_t ttl_sec, uint32_t max_uses,
+                             char* out_token, size_t out_token_len, uint32_t* out_id) {
+    if (!label || !*label || !out_token || out_token_len < 2 || !out_id) {
+        return -1;
+    }
+
+    uint32_t ttl_cap = g_state.config.admin.service_token_max_ttl_sec;
+    if (ttl_cap == 0) {
+        ttl_cap = 2592000;
+    }
+    if (ttl_sec == 0 || ttl_sec > ttl_cap) {
+        ttl_sec = ttl_cap;
+    }
+
+    pthread_mutex_lock(&g_state.lock);
+
+    int slot = -1;
+    for (int i = 0; i < SPF_MAX_SERVICE_TOKENS; i++) {
+        if (!g_state.service_tokens[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_state.lock);
+        return -2;
+    }
+
+    spf_service_token_t* st = &g_state.service_tokens[slot];
+    memset(st, 0, sizeof(*st));
+    st->active = true;
+    st->id = ++g_state.next_service_token_id;
+    strncpy(st->label, label, sizeof(st->label) - 1);
+    st->label[sizeof(st->label) - 1] = '\0';
+    st->read_only = read_only;
+    st->max_uses = max_uses;
+    st->created_ts = spf_time_sec();
+    st->expires_at = st->created_ts + ttl_sec;
+    spf_generate_token(st->token, sizeof(st->token));
+
+    strncpy(out_token, st->token, out_token_len - 1);
+    out_token[out_token_len - 1] = '\0';
+    *out_id = st->id;
+
+    pthread_mutex_unlock(&g_state.lock);
+    return 0;
+}
+
+static bool service_token_try_auth(const char* token, const char* src_ip, admin_role_t* out_role) {
+    if (!token || !*token || !out_role) {
+        return false;
+    }
+
+    uint64_t now = spf_time_sec();
+    bool ok = false;
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < SPF_MAX_SERVICE_TOKENS; i++) {
+        spf_service_token_t* st = &g_state.service_tokens[i];
+        if (!st->active) {
+            continue;
+        }
+        if (!secure_token_equals(st->token, token)) {
+            continue;
+        }
+        if (st->expires_at <= now) {
+            st->active = false;
+            break;
+        }
+        if (st->max_uses > 0 && st->uses >= st->max_uses) {
+            st->active = false;
+            break;
+        }
+
+        st->uses++;
+        st->last_used_ts = now;
+        if (src_ip) {
+            strncpy(st->last_used_ip, src_ip, sizeof(st->last_used_ip) - 1);
+            st->last_used_ip[sizeof(st->last_used_ip) - 1] = '\0';
+        }
+
+        *out_role = st->read_only ? ADMIN_ROLE_READONLY : ADMIN_ROLE_ADMIN;
+        ok = true;
+        break;
+    }
+    pthread_mutex_unlock(&g_state.lock);
+
+    pthread_mutex_lock(&g_state.stats_lock);
+    if (ok) {
+        g_state.admin_service_token_auth_success++;
+    } else {
+        g_state.admin_service_token_auth_fail++;
+    }
+    pthread_mutex_unlock(&g_state.stats_lock);
+
+    return ok;
+}
+
+static int service_token_delete(uint32_t id) {
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < SPF_MAX_SERVICE_TOKENS; i++) {
+        if (g_state.service_tokens[i].active && g_state.service_tokens[i].id == id) {
+            memset(&g_state.service_tokens[i], 0, sizeof(g_state.service_tokens[i]));
+            pthread_mutex_unlock(&g_state.lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_state.lock);
+    return -1;
+}
+
+static void service_tokens_compact_expired(void) {
+    uint64_t now = spf_time_sec();
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < SPF_MAX_SERVICE_TOKENS; i++) {
+        spf_service_token_t* st = &g_state.service_tokens[i];
+        if (!st->active) continue;
+        if ((st->expires_at > 0 && st->expires_at <= now) ||
+            (st->max_uses > 0 && st->uses >= st->max_uses)) {
+            memset(st, 0, sizeof(*st));
+        }
+    }
+    pthread_mutex_unlock(&g_state.lock);
+}
+
+static int temp_access_grant_add(const char* ip, uint32_t ttl_sec) {
+    if (!ip || !*ip) {
+        return -1;
+    }
+
+    struct in_addr parsed;
+    if (inet_pton(AF_INET, ip, &parsed) != 1) {
+        return -1;
+    }
+
+    uint32_t ttl_cap = g_state.config.admin.temp_grant_max_ttl_sec;
+    if (ttl_cap == 0) {
+        ttl_cap = 604800;
+    }
+    if (ttl_sec == 0 || ttl_sec > ttl_cap) {
+        ttl_sec = ttl_cap;
+    }
+
+    uint64_t now = spf_time_sec();
+
+    pthread_mutex_lock(&g_state.lock);
+    int free_idx = -1;
+    for (int i = 0; i < SPF_MAX_TEMP_ADMIN_GRANTS; i++) {
+        spf_temp_admin_grant_t* g = &g_state.temp_admin_grants[i];
+        if (g->active && strcmp(g->ip, ip) == 0) {
+            g->created_ts = now;
+            g->expires_at = now + ttl_sec;
+            pthread_mutex_unlock(&g_state.lock);
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.admin_temp_grants_created++;
+            pthread_mutex_unlock(&g_state.stats_lock);
+            return 1;
+        }
+        if (!g->active && free_idx < 0) {
+            free_idx = i;
+        }
+    }
+
+    if (free_idx < 0) {
+        pthread_mutex_unlock(&g_state.lock);
+        return -2;
+    }
+
+    spf_temp_admin_grant_t* g = &g_state.temp_admin_grants[free_idx];
+    memset(g, 0, sizeof(*g));
+    g->active = true;
+    g->created_ts = now;
+    g->expires_at = now + ttl_sec;
+    strncpy(g->ip, ip, sizeof(g->ip) - 1);
+    g->ip[sizeof(g->ip) - 1] = '\0';
+    pthread_mutex_unlock(&g_state.lock);
+
+    pthread_mutex_lock(&g_state.stats_lock);
+    g_state.admin_temp_grants_created++;
+    pthread_mutex_unlock(&g_state.stats_lock);
+    return 0;
+}
+
+static int temp_access_grant_revoke(const char* ip) {
+    if (!ip || !*ip) return -1;
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < SPF_MAX_TEMP_ADMIN_GRANTS; i++) {
+        spf_temp_admin_grant_t* g = &g_state.temp_admin_grants[i];
+        if (g->active && strcmp(g->ip, ip) == 0) {
+            memset(g, 0, sizeof(*g));
+            pthread_mutex_unlock(&g_state.lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_state.lock);
+    return -1;
+}
+
+static bool temp_access_grant_is_allowed(const char* ip) {
+    if (!ip || !*ip) return false;
+
+    uint64_t now = spf_time_sec();
+    bool ok = false;
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < SPF_MAX_TEMP_ADMIN_GRANTS; i++) {
+        spf_temp_admin_grant_t* g = &g_state.temp_admin_grants[i];
+        if (!g->active) continue;
+        if (g->expires_at <= now) {
+            memset(g, 0, sizeof(*g));
+            continue;
+        }
+        if (strcmp(g->ip, ip) == 0) {
+            ok = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_state.lock);
+    return ok;
+}
+
+static void temp_access_grants_compact_expired(void) {
+    uint64_t now = spf_time_sec();
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < SPF_MAX_TEMP_ADMIN_GRANTS; i++) {
+        spf_temp_admin_grant_t* g = &g_state.temp_admin_grants[i];
+        if (!g->active) {
+            continue;
+        }
+        if (g->expires_at <= now) {
+            memset(g, 0, sizeof(*g));
+        }
+    }
+    pthread_mutex_unlock(&g_state.lock);
+}
+
 static void apply_admin_security_defaults(void) {
     if (g_state.config.admin.max_cmds_per_min == 0) {
         g_state.config.admin.max_cmds_per_min = 240;
@@ -332,6 +594,12 @@ static void apply_admin_security_defaults(void) {
     }
     if (g_state.config.admin.idle_timeout_sec == 0) {
         g_state.config.admin.idle_timeout_sec = 300;
+    }
+    if (g_state.config.admin.service_token_max_ttl_sec == 0) {
+        g_state.config.admin.service_token_max_ttl_sec = 2592000;
+    }
+    if (g_state.config.admin.temp_grant_max_ttl_sec == 0) {
+        g_state.config.admin.temp_grant_max_ttl_sec = 604800;
     }
 }
 
@@ -501,13 +769,13 @@ static bool is_admin_ip_allowed(const struct sockaddr_in* addr) {
     }
     pthread_mutex_unlock(&g_state.lock);
 
-    if (allow_count == 0) {
-        return true;
-    }
-
     char ip[SPF_IP_MAX_LEN];
     if (!inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip))) {
         return false;
+    }
+
+    if (allow_count == 0) {
+        return true;
     }
 
     for (uint8_t i = 0; i < allow_count; i++) {
@@ -515,6 +783,11 @@ static bool is_admin_ip_allowed(const struct sockaddr_in* addr) {
             return true;
         }
     }
+
+    if (temp_access_grant_is_allowed(ip)) {
+        return true;
+    }
+
     return false;
 }
 
@@ -1240,6 +1513,7 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
     if (!ctrl_send(fd, ssl, "> ")) return;
     
     while (!g_shutdown) {
+        service_tokens_compact_expired();
         uint64_t now_sec = spf_time_sec();
         if (g_state.config.admin.idle_timeout_sec > 0 && (now_sec - last_activity) >= g_state.config.admin.idle_timeout_sec) {
             ctrl_send(fd, ssl, "ERR idle timeout\n");
@@ -1302,6 +1576,10 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                     admin_tracker_auth_success(src_ip, spf_time_sec());
                     snprintf(resp, sizeof(resp), "OK authenticated readonly\n");
                     spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "ok", "authenticated readonly");
+                } else if (service_token_try_auth(provided, src_ip, &role)) {
+                    admin_tracker_auth_success(src_ip, spf_time_sec());
+                    snprintf(resp, sizeof(resp), "OK authenticated service token (%s)\n", admin_role_str(role));
+                    spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "ok", "authenticated service token");
                 } else {
                     uint32_t lockout_for = 0;
                     bool locked = admin_tracker_auth_fail(
@@ -1347,6 +1625,7 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 "Commands:\n"
                 "  AUTH <token>       - authenticate\n"
                 "  AUTH <readonly_token> - readonly authenticate\n"
+                "  AUTH <service_token>  - scoped service authenticate\n"
                 "  STATUS             - system stats\n"
                 "  RULES              - list rules\n"
                 "  BACKENDS <id>      - show backends\n"
@@ -1365,6 +1644,12 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 "  RELOAD             - reload config from disk\n"
                 "  HEALTH <id>        - backend health snapshot\n"
                 "  READONLY ON|OFF    - toggle global readonly mode\n"
+                "  TOKENADD <label> <ro|rw> <ttl_sec> [max_uses]\n"
+                "  TOKENLIST          - list service tokens\n"
+                "  TOKENDEL <id>      - revoke service token\n"
+                "  ACCESSGRANT <ip> [ttl_sec] - temporary admin access\n"
+                "  ACCESSGRANTS       - list temporary admin grants\n"
+                "  ACCESSREVOKE <ip>  - revoke temporary admin grant\n"
                 "  STAGE <k> <v>      - stage admin config change\n"
                 "  APPLY              - apply staged admin changes\n"
                 "  ROLLBACK           - rollback last APPLY\n"
@@ -1391,6 +1676,11 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 "Admin Auth Fails: %lu\n"
                 "Admin Lockouts: %lu\n"
                 "Admin Cmd Rate Limited: %lu\n"
+                "Service Token Auth OK: %lu\n"
+                "Service Token Auth Fail: %lu\n"
+                "Temp Access Grants Created: %lu\n"
+                "Service Token Max TTL: %u sec\n"
+                "Temp Grant Max TTL: %u sec\n"
                 "Session Role: %s\n",
                 SPF_VERSION,
                 up/3600, (up%3600)/60, up%60,
@@ -1404,6 +1694,11 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 g_state.admin_auth_failures,
                 g_state.admin_lockouts,
                 g_state.admin_cmd_rate_limited,
+                g_state.admin_service_token_auth_success,
+                g_state.admin_service_token_auth_fail,
+                g_state.admin_temp_grants_created,
+                g_state.config.admin.service_token_max_ttl_sec,
+                g_state.config.admin.temp_grant_max_ttl_sec,
                 role == ADMIN_ROLE_ADMIN ? "admin" : (role == ADMIN_ROLE_READONLY ? "readonly" : "none"));
         }
         else if (strncmp(buf, "RULES", 5) == 0) {
@@ -1725,6 +2020,139 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 snprintf(resp, sizeof(resp), "ERR usage: READONLY ON|OFF\n");
             }
         }
+        else if (strncmp(buf, "TOKENADD ", 9) == 0) {
+            char label[64] = {0};
+            char mode[8] = {0};
+            char ttl_s[32] = {0};
+            char uses_s[32] = {0};
+            int parsed = sscanf(buf + 9, "%63s %7s %31s %31s", label, mode, ttl_s, uses_s);
+            if (parsed >= 3) {
+                bool ro;
+                if (strcmp(mode, "ro") == 0) {
+                    ro = true;
+                } else if (strcmp(mode, "rw") == 0) {
+                    ro = false;
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR mode must be ro|rw\n");
+                    goto send_resp;
+                }
+
+                uint32_t ttl = 0;
+                if (!parse_u32_strict(ttl_s, &ttl)) {
+                    snprintf(resp, sizeof(resp), "ERR invalid ttl\n");
+                    goto send_resp;
+                }
+
+                uint32_t max_uses = 0;
+                if (parsed == 4 && !parse_u32_strict(uses_s, &max_uses)) {
+                    snprintf(resp, sizeof(resp), "ERR invalid max_uses\n");
+                    goto send_resp;
+                }
+
+                char created_token[SPF_TOKEN_MAX];
+                uint32_t token_id = 0;
+                int rc = service_token_add(label, ro, ttl, max_uses, created_token, sizeof(created_token), &token_id);
+                if (rc == 0) {
+                    snprintf(resp, sizeof(resp), "OK token id=%u token=%s\n", token_id, created_token);
+                } else if (rc == -2) {
+                    snprintf(resp, sizeof(resp), "ERR token store full\n");
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR failed to add token\n");
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: TOKENADD <label> <ro|rw> <ttl_sec> [max_uses]\n");
+            }
+        }
+        else if (strncmp(buf, "TOKENLIST", 9) == 0) {
+            service_tokens_compact_expired();
+            char* p = resp;
+            p += snprintf(p, SPF_RES_MAX_LEN - (p - resp), "--- SERVICE TOKENS ---\n");
+            uint64_t now = spf_time_sec();
+            pthread_mutex_lock(&g_state.lock);
+            for (int i = 0; i < SPF_MAX_SERVICE_TOKENS && p - resp < SPF_RES_MAX_LEN - 140; i++) {
+                spf_service_token_t* st = &g_state.service_tokens[i];
+                if (!st->active) {
+                    continue;
+                }
+                uint64_t ttl_left = st->expires_at > now ? st->expires_at - now : 0;
+                p += snprintf(p, SPF_RES_MAX_LEN - (p - resp),
+                              "id=%u label=%s role=%s uses=%u/%u ttl_left=%lu last_ip=%s\n",
+                              st->id,
+                              st->label,
+                              st->read_only ? "readonly" : "admin",
+                              st->uses,
+                              st->max_uses,
+                              ttl_left,
+                              st->last_used_ip[0] ? st->last_used_ip : "-");
+            }
+            pthread_mutex_unlock(&g_state.lock);
+        }
+        else if (strncmp(buf, "TOKENDEL ", 9) == 0) {
+            uint32_t id = 0;
+            if (parse_u32_strict(buf + 9, &id)) {
+                int rc = service_token_delete(id);
+                if (rc == 0) {
+                    snprintf(resp, sizeof(resp), "OK token deleted\n");
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR token not found\n");
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: TOKENDEL <id>\n");
+            }
+        }
+        else if (strncmp(buf, "ACCESSGRANT ", 12) == 0) {
+            char ip[SPF_IP_MAX_LEN] = {0};
+            char ttl_s[32] = {0};
+            uint32_t ttl = 0;
+            int parsed = sscanf(buf + 12, "%45s %31s", ip, ttl_s);
+            if (parsed >= 1) {
+                if (parsed == 2 && !parse_u32_strict(ttl_s, &ttl)) {
+                    snprintf(resp, sizeof(resp), "ERR invalid ttl\n");
+                    goto send_resp;
+                }
+                int rc = temp_access_grant_add(ip, ttl);
+                if (rc == 0) {
+                    snprintf(resp, sizeof(resp), "OK temp access granted %s\n", ip);
+                } else if (rc == 1) {
+                    snprintf(resp, sizeof(resp), "OK temp access renewed %s\n", ip);
+                } else if (rc == -2) {
+                    snprintf(resp, sizeof(resp), "ERR temp grant store full\n");
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR invalid ip\n");
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: ACCESSGRANT <ip> [ttl_sec]\n");
+            }
+        }
+        else if (strncmp(buf, "ACCESSGRANTS", 12) == 0) {
+            temp_access_grants_compact_expired();
+            char* p = resp;
+            p += snprintf(p, SPF_RES_MAX_LEN - (p - resp), "--- TEMP ACCESS GRANTS ---\n");
+            uint64_t now = spf_time_sec();
+            pthread_mutex_lock(&g_state.lock);
+            for (int i = 0; i < SPF_MAX_TEMP_ADMIN_GRANTS && p - resp < SPF_RES_MAX_LEN - 80; i++) {
+                spf_temp_admin_grant_t* g = &g_state.temp_admin_grants[i];
+                if (!g->active) {
+                    continue;
+                }
+                uint64_t ttl_left = g->expires_at > now ? g->expires_at - now : 0;
+                p += snprintf(p, SPF_RES_MAX_LEN - (p - resp), "ip=%s ttl_left=%lu\n", g->ip, ttl_left);
+            }
+            pthread_mutex_unlock(&g_state.lock);
+        }
+        else if (strncmp(buf, "ACCESSREVOKE ", 13) == 0) {
+            char ip[SPF_IP_MAX_LEN] = {0};
+            if (sscanf(buf + 13, "%45s", ip) == 1) {
+                int rc = temp_access_grant_revoke(ip);
+                if (rc == 0) {
+                    snprintf(resp, sizeof(resp), "OK temp access revoked %s\n", ip);
+                } else {
+                    snprintf(resp, sizeof(resp), "ERR grant not found\n");
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: ACCESSREVOKE <ip>\n");
+            }
+        }
         else if (strncmp(buf, "STAGE ", 6) == 0) {
             char key[64] = {0};
             char value[256] = {0};
@@ -1776,6 +2204,8 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 "auth_fail_threshold=%u\n"
                 "auth_lockout_sec=%u\n"
                 "idle_timeout_sec=%u\n"
+                "service_token_max_ttl_sec=%u\n"
+                "temp_grant_max_ttl_sec=%u\n"
                 "audit_log=%s\n"
                 "staged_changes=%u\n",
                 g_state.config.admin.tls_enabled ? "true" : "false",
@@ -1786,6 +2216,8 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 g_state.config.admin.auth_fail_threshold,
                 g_state.config.admin.auth_lockout_sec,
                 g_state.config.admin.idle_timeout_sec,
+                g_state.config.admin.service_token_max_ttl_sec,
+                g_state.config.admin.temp_grant_max_ttl_sec,
                 g_state.config.admin.audit_log_path[0] ? g_state.config.admin.audit_log_path : "(disabled)",
                 g_state.staged_change_count);
         }
@@ -1881,6 +2313,7 @@ void* ctrl_thread(void* arg) {
     spf_log(SPF_LOG_INFO, "ctrl listening on %s:%u", g_state.config.admin.bind_addr, g_state.config.admin.port);
     
     while (!g_shutdown && g_state.running) {
+        temp_access_grants_compact_expired();
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(g_ctrl_fd, &fds);

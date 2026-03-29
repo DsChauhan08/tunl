@@ -109,6 +109,12 @@ spf_ctrl_cmd_kind_t spf_ctrl_classify_command(const char* line) {
     if (strncmp(line, "LOGS", 4) == 0) return SPF_CTRL_CMD_LOGS;
     if (strncmp(line, "METRICS", 7) == 0) return SPF_CTRL_CMD_METRICS;
     if (strncmp(line, "TLSINFO", 7) == 0) return SPF_CTRL_CMD_TLSINFO;
+    if (strncmp(line, "TOKENADD ", 9) == 0) return SPF_CTRL_CMD_TOKENADD;
+    if (strncmp(line, "TOKENLIST", 9) == 0) return SPF_CTRL_CMD_TOKENLIST;
+    if (strncmp(line, "TOKENDEL ", 9) == 0) return SPF_CTRL_CMD_TOKENDEL;
+    if (strncmp(line, "ACCESSGRANT ", 12) == 0) return SPF_CTRL_CMD_ACCESSGRANT;
+    if (strncmp(line, "ACCESSGRANTS", 12) == 0) return SPF_CTRL_CMD_ACCESSGRANTS;
+    if (strncmp(line, "ACCESSREVOKE ", 13) == 0) return SPF_CTRL_CMD_ACCESSREVOKE;
     if (strncmp(line, "STAGE ", 6) == 0) return SPF_CTRL_CMD_STAGE;
     if (strncmp(line, "APPLY", 5) == 0) return SPF_CTRL_CMD_APPLY;
     if (strncmp(line, "ROLLBACK", 8) == 0) return SPF_CTRL_CMD_ROLLBACK;
@@ -246,6 +252,8 @@ void spf_init(spf_state_t* state) {
     state->config.admin.auth_fail_threshold = 5;
     state->config.admin.auth_lockout_sec = 300;
     state->config.admin.idle_timeout_sec = 300;
+    state->config.admin.service_token_max_ttl_sec = 2592000;
+    state->config.admin.temp_grant_max_ttl_sec = 604800;
     strncpy(state->config.admin.audit_log_path, "spf_audit.log", SPF_PATH_MAX - 1);
     state->config.admin.audit_log_path[SPF_PATH_MAX - 1] = '\0';
     state->config.metrics.port = SPF_METRICS_PORT_DEFAULT;

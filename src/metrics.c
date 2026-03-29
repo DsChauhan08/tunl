@@ -29,6 +29,9 @@ static const metric_def_t metrics[] = {
     {"spf_admin_auth_failures_total", "Failed admin authentications", "counter"},
     {"spf_admin_lockouts_total", "Admin lockouts triggered", "counter"},
     {"spf_admin_cmd_rate_limited_total", "Admin commands rate-limited", "counter"},
+    {"spf_admin_service_token_auth_success_total", "Successful service-token admin auth", "counter"},
+    {"spf_admin_service_token_auth_fail_total", "Failed service-token admin auth", "counter"},
+    {"spf_admin_temp_grants_created_total", "Temporary admin grants created", "counter"},
     {NULL, NULL, NULL}
 };
 
@@ -67,7 +70,10 @@ int metrics_format(spf_state_t* state, char* buf, size_t len) {
         "spf_uptime_seconds %lu\n"
         "spf_admin_auth_failures_total %lu\n"
         "spf_admin_lockouts_total %lu\n"
-        "spf_admin_cmd_rate_limited_total %lu\n",
+        "spf_admin_service_token_auth_success_total %lu\n"
+        "spf_admin_service_token_auth_fail_total %lu\n"
+        "spf_admin_cmd_rate_limited_total %lu\n"
+        "spf_admin_temp_grants_created_total %lu\n",
         state->active_conns,
         state->total_conns,
         state->total_bytes_in,
@@ -77,7 +83,10 @@ int metrics_format(spf_state_t* state, char* buf, size_t len) {
         uptime,
         state->admin_auth_failures,
         state->admin_lockouts,
-        state->admin_cmd_rate_limited);
+        state->admin_service_token_auth_success,
+        state->admin_service_token_auth_fail,
+        state->admin_cmd_rate_limited,
+        state->admin_temp_grants_created);
     pthread_mutex_unlock(&state->stats_lock);
 
     for (int i = 0; i < SPF_MAX_RULES; i++) {

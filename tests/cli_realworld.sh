@@ -36,6 +36,8 @@ max_cmds_per_min = 240
 auth_fail_threshold = 3
 auth_lockout_sec = 3
 idle_timeout_sec = 120
+service_token_max_ttl_sec = 30
+temp_grant_max_ttl_sec = 30
 audit_log = /tmp/spf-cli-audit.log
 allowlist = 127.0.0.1
 
@@ -182,6 +184,60 @@ printf '%s\n' "$DUAL_OUT" | rg -q 'OK applied staged config'
 printf '%s\n' "$DUAL_OUT" | rg -q 'max_cmds_per_min=123'
 printf '%s\n' "$DUAL_OUT" | rg -q 'OK rolled back'
 printf '%s\n' "$DUAL_OUT" | rg -q 'max_cmds_per_min=240'
+
+echo "[cli] validating service token auth and temp access grants"
+TOK_OUT=$( {
+  printf 'AUTH secret\n'; sleep 0.2
+  printf 'TOKENADD ci rw 15 2\n'; sleep 0.2
+  printf 'TOKENLIST\n'; sleep 0.2
+  printf 'ACCESSGRANT 127.0.0.2 10\n'; sleep 0.2
+  printf 'ACCESSGRANTS\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$TOK_OUT"
+printf '%s\n' "$TOK_OUT" | rg -q 'OK token id='
+printf '%s\n' "$TOK_OUT" | rg -q -- '--- SERVICE TOKENS ---'
+printf '%s\n' "$TOK_OUT" | rg -q 'OK temp access granted 127.0.0.2'
+printf '%s\n' "$TOK_OUT" | rg -q -- '--- TEMP ACCESS GRANTS ---'
+
+SVC_TOKEN=$(printf '%s\n' "$TOK_OUT" | rg -o 'token=[A-Za-z0-9]+' | sed 's/token=//' | head -n 1)
+if [[ -z "$SVC_TOKEN" ]]; then
+  echo "[cli] failed to parse service token"
+  exit 1
+fi
+
+SVC_AUTH_OUT=$( {
+  printf 'AUTH %s\n' "$SVC_TOKEN"; sleep 0.2
+  printf 'STATUS\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$SVC_AUTH_OUT"
+printf '%s\n' "$SVC_AUTH_OUT" | rg -q 'OK authenticated service token'
+
+TOK_DEL_OUT=$( {
+  printf 'AUTH secret\n'; sleep 0.2
+  printf 'TOKENLIST\n'; sleep 0.2
+  printf 'TOKENDEL 1\n'; sleep 0.2
+  printf 'ACCESSREVOKE 127.0.0.2\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$TOK_DEL_OUT"
+printf '%s\n' "$TOK_DEL_OUT" | rg -q 'token deleted|token not found'
+printf '%s\n' "$TOK_DEL_OUT" | rg -q 'temp access revoked 127.0.0.2'
+
+echo "[cli] validating token metrics surfacing"
+TOK_METRICS=$( {
+  printf 'AUTH secret\n'; sleep 0.2
+  printf 'METRICS\n'; sleep 0.2
+  printf 'QUIT\n'
+} | nc 127.0.0.1 18081 )
+
+echo "$TOK_METRICS"
+printf '%s\n' "$TOK_METRICS" | rg -q 'spf_admin_service_token_auth_success_total'
+printf '%s\n' "$TOK_METRICS" | rg -q 'spf_admin_temp_grants_created_total'
 
 echo "[cli] validating audit log entries"
 [[ -f /tmp/spf-cli-audit.log ]]

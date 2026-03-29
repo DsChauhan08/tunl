@@ -11,6 +11,8 @@ max_cmds_per_min = 240
 auth_fail_threshold = 5
 auth_lockout_sec = 300
 idle_timeout_sec = 300
+service_token_max_ttl_sec = 2592000
+temp_grant_max_ttl_sec = 604800
 audit_log = /var/log/spf_audit.log
 allowlist = 127.0.0.1
 
