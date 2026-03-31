@@ -10,6 +10,86 @@
 static SSL_CTX* g_server_ctx = NULL;
 static SSL_CTX* g_client_ctx = NULL;
 
+#define SPF_BACKEND_CTX_CACHE_SIZE 64
+
+typedef struct {
+    bool in_use;
+    bool verify_peer;
+    char ca_path[SPF_PATH_MAX];
+    SSL_CTX* ctx;
+} spf_backend_ctx_cache_t;
+
+static spf_backend_ctx_cache_t g_backend_ctx_cache[SPF_BACKEND_CTX_CACHE_SIZE];
+static pthread_mutex_t g_backend_ctx_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static SSL_CTX* backend_ctx_create(const char* ca_path, bool verify_peer) {
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        return NULL;
+    }
+
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+
+    if (verify_peer) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        if (ca_path && *ca_path) {
+            if (SSL_CTX_load_verify_locations(ctx, ca_path, NULL) != 1) {
+                spf_log(SPF_LOG_ERROR, "tls: failed to load backend CA: %s", ca_path);
+                SSL_CTX_free(ctx);
+                return NULL;
+            }
+        } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            spf_log(SPF_LOG_WARN, "tls: could not load default backend trust store");
+        }
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+
+    return ctx;
+}
+
+static SSL_CTX* backend_ctx_get(const char* ca_path, bool verify_peer) {
+    const char* path = (ca_path && *ca_path) ? ca_path : "";
+
+    pthread_mutex_lock(&g_backend_ctx_cache_lock);
+    int free_slot = -1;
+    for (int i = 0; i < SPF_BACKEND_CTX_CACHE_SIZE; i++) {
+        if (g_backend_ctx_cache[i].in_use) {
+            if (g_backend_ctx_cache[i].verify_peer == verify_peer &&
+                strcmp(g_backend_ctx_cache[i].ca_path, path) == 0) {
+                SSL_CTX* hit = g_backend_ctx_cache[i].ctx;
+                pthread_mutex_unlock(&g_backend_ctx_cache_lock);
+                return hit;
+            }
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+
+    if (free_slot < 0) {
+        pthread_mutex_unlock(&g_backend_ctx_cache_lock);
+        spf_log(SPF_LOG_ERROR, "tls: backend ctx cache exhausted");
+        return NULL;
+    }
+
+    SSL_CTX* created = backend_ctx_create(path, verify_peer);
+    if (!created) {
+        pthread_mutex_unlock(&g_backend_ctx_cache_lock);
+        return NULL;
+    }
+
+    g_backend_ctx_cache[free_slot].in_use = true;
+    g_backend_ctx_cache[free_slot].verify_peer = verify_peer;
+    g_backend_ctx_cache[free_slot].ctx = created;
+    strncpy(g_backend_ctx_cache[free_slot].ca_path, path, SPF_PATH_MAX - 1);
+    g_backend_ctx_cache[free_slot].ca_path[SPF_PATH_MAX - 1] = '\0';
+
+    pthread_mutex_unlock(&g_backend_ctx_cache_lock);
+    return created;
+}
+
 int tls_init(const char* cert, const char* key) {
     SSL_library_init();
     SSL_load_error_strings();
@@ -83,6 +163,16 @@ void tls_cleanup(void) {
         SSL_CTX_free(g_client_ctx);
         g_client_ctx = NULL;
     }
+
+    pthread_mutex_lock(&g_backend_ctx_cache_lock);
+    for (int i = 0; i < SPF_BACKEND_CTX_CACHE_SIZE; i++) {
+        if (g_backend_ctx_cache[i].in_use && g_backend_ctx_cache[i].ctx) {
+            SSL_CTX_free(g_backend_ctx_cache[i].ctx);
+        }
+        memset(&g_backend_ctx_cache[i], 0, sizeof(g_backend_ctx_cache[i]));
+    }
+    pthread_mutex_unlock(&g_backend_ctx_cache_lock);
+
     EVP_cleanup();
     ERR_free_strings();
 }
@@ -134,34 +224,15 @@ SSL* tls_connect(int fd, const char* hostname) {
 }
 
 SSL* tls_connect_backend(int fd, const char* hostname, const char* ca_path, bool verify_peer) {
-    if (!g_client_ctx) return NULL;
-
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX* ctx = backend_ctx_get(ca_path, verify_peer);
     if (!ctx) {
         return NULL;
     }
 
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
-
-    if (verify_peer) {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-        if (ca_path && *ca_path) {
-            if (SSL_CTX_load_verify_locations(ctx, ca_path, NULL) != 1) {
-                spf_log(SPF_LOG_ERROR, "tls: failed to load backend CA: %s", ca_path);
-                SSL_CTX_free(ctx);
-                return NULL;
-            }
-        } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
-            spf_log(SPF_LOG_WARN, "tls: could not load default backend trust store");
-        }
-    } else {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-    }
-
     SSL* ssl = SSL_new(ctx);
-    if (!ssl) return NULL;
+    if (!ssl) {
+        return NULL;
+    }
 
     SSL_set_fd(ssl, fd);
 
@@ -171,7 +242,6 @@ SSL* tls_connect_backend(int fd, const char* hostname, const char* ca_path, bool
 
     if (verify_peer && hostname && *hostname) {
         if (SSL_set1_host(ssl, hostname) != 1) {
-            SSL_CTX_free(ctx);
             SSL_free(ssl);
             return NULL;
         }
@@ -179,12 +249,9 @@ SSL* tls_connect_backend(int fd, const char* hostname, const char* ca_path, bool
 
     if (SSL_connect(ssl) <= 0) {
         ERR_print_errors_fp(stderr);
-        SSL_CTX_free(ctx);
         SSL_free(ssl);
         return NULL;
     }
-
-    SSL_CTX_free(ctx);
 
     return ssl;
 }

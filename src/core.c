@@ -275,6 +275,13 @@ void spf_init(spf_state_t* state) {
 
 void spf_shutdown(spf_state_t* state) {
     state->running = false;
+
+    for (int i = 0; i < SPF_MAX_RULES; i++) {
+        pthread_mutex_destroy(&state->rules[i].lock);
+        for (int j = 0; j < SPF_MAX_BACKENDS; j++) {
+            pthread_mutex_destroy(&state->rules[i].backends[j].lock);
+        }
+    }
     
     pthread_mutex_destroy(&state->lock);
     pthread_mutex_destroy(&state->stats_lock);

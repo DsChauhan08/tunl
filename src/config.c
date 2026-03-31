@@ -280,7 +280,6 @@ int spf_load_config(spf_state_t* state, const char* path) {
             else if (strcmp(key, "backend") == 0 && current_rule) {
                 if (current_rule->backend_count < SPF_MAX_BACKENDS) {
                     parse_backend(val, &current_rule->backends[current_rule->backend_count]);
-                    pthread_mutex_init(&current_rule->backends[current_rule->backend_count].lock, NULL);
                     current_rule->backend_count++;
                 }
             }
