@@ -231,7 +231,7 @@ READONLY ON|OFF           # toggle global readonly mode
 STAGE <key> <value>       # stage admin config change
 APPLY                     # apply staged admin config changes
 ROLLBACK                  # rollback most recent APPLY
-TOKENADD <label> <ro|rw> <ttl_sec> [max_uses]  # mint scoped service token
+TOKENADD <label> <ro|rw> <ttl_sec> [max_uses] <token>  # register scoped service token
 TOKENLIST                 # list active service tokens (without secret)
 TOKENDEL <id>             # revoke service token
 ACCESSGRANT <ip> [ttl]    # temporary allowlist grant for admin plane

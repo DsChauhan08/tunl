@@ -125,6 +125,7 @@ typedef struct {
     uint32_t rr_index;
     uint64_t rate_bps;
     uint32_t max_conns;
+    uint64_t epoch;
     pthread_t listen_thread;
     pthread_t health_thread;
     bool listener_started;
@@ -288,6 +289,7 @@ typedef struct {
     spf_service_token_t service_tokens[SPF_MAX_SERVICE_TOKENS];
     uint32_t next_service_token_id;
     spf_temp_admin_grant_t temp_admin_grants[SPF_MAX_TEMP_ADMIN_GRANTS];
+    uint64_t next_rule_epoch;
     spf_admin_cfg_t last_admin_snapshot;
     bool has_admin_snapshot;
     char audit_prev_hash[65];
@@ -411,6 +413,7 @@ SSL_CTX* tls_get_server_ctx(void);
 SSL_CTX* tls_get_client_ctx(void);
 SSL* tls_accept(int fd);
 SSL* tls_connect(int fd, const char* hostname);
+SSL* tls_connect_backend(int fd, const char* hostname, const char* ca_path, bool verify_peer);
 ssize_t tls_read(SSL* ssl, void* buf, size_t len);
 ssize_t tls_write(SSL* ssl, const void* buf, size_t len);
 void tls_close(SSL* ssl);

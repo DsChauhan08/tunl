@@ -81,10 +81,10 @@ debug:
 	@$(MAKE) BUILD_MODE=debug all
 
 asan:
-	@$(MAKE) BUILD_MODE=debug CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=address -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address"
+	@$(MAKE) BUILD_MODE=debug CC=clang CXX=clang++ CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=address -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address" TARGET=spf-asan
 
 ubsan:
-	@$(MAKE) BUILD_MODE=debug CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=undefined"
+	@$(MAKE) BUILD_MODE=debug CC=clang CXX=clang++ CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=undefined" TARGET=spf-ubsan
 
 sanitizers: asan ubsan
 

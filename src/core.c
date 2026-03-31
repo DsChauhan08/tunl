@@ -245,6 +245,13 @@ void spf_init(spf_state_t* state) {
     pthread_mutex_init(&state->audit_lock, NULL);
     pthread_mutex_init(&state->events.lock, NULL);
     pthread_rwlock_init(&state->blocklist.lock, NULL);
+
+    for (int i = 0; i < SPF_MAX_RULES; i++) {
+        pthread_mutex_init(&state->rules[i].lock, NULL);
+        for (int j = 0; j < SPF_MAX_BACKENDS; j++) {
+            pthread_mutex_init(&state->rules[i].backends[j].lock, NULL);
+        }
+    }
     
     strncpy(state->config.admin.bind_addr, "127.0.0.1", SPF_IP_MAX_LEN);
     state->config.admin.port = SPF_CTRL_PORT_DEFAULT;
@@ -268,6 +275,13 @@ void spf_init(spf_state_t* state) {
 
 void spf_shutdown(spf_state_t* state) {
     state->running = false;
+
+    for (int i = 0; i < SPF_MAX_RULES; i++) {
+        pthread_mutex_destroy(&state->rules[i].lock);
+        for (int j = 0; j < SPF_MAX_BACKENDS; j++) {
+            pthread_mutex_destroy(&state->rules[i].backends[j].lock);
+        }
+    }
     
     pthread_mutex_destroy(&state->lock);
     pthread_mutex_destroy(&state->stats_lock);
@@ -283,6 +297,103 @@ void spf_shutdown(spf_state_t* state) {
     spf_log(SPF_LOG_INFO, "shutdown complete");
 }
 
+static void clear_backend_no_lock(spf_backend_t* b) {
+    if (!b) {
+        return;
+    }
+    memset(b->host, 0, sizeof(b->host));
+    b->port = 0;
+    b->weight = 1;
+    b->state = SPF_BACKEND_UP;
+    b->active_conns = 0;
+    b->total_conns = 0;
+    b->bytes_in = 0;
+    b->bytes_out = 0;
+    b->last_health_check = 0;
+    b->health_fails = 0;
+    b->tls_enabled = false;
+    b->tls_verify = false;
+    b->tls_pin_enabled = false;
+    memset(b->tls_server_name, 0, sizeof(b->tls_server_name));
+    memset(b->tls_ca_path, 0, sizeof(b->tls_ca_path));
+    memset(b->tls_pin_sha256, 0, sizeof(b->tls_pin_sha256));
+}
+
+static void copy_backend_no_lock(spf_backend_t* dst, const spf_backend_t* src) {
+    if (!dst || !src) {
+        return;
+    }
+    strncpy(dst->host, src->host, sizeof(dst->host) - 1);
+    dst->host[sizeof(dst->host) - 1] = '\0';
+    dst->port = src->port;
+    dst->weight = src->weight;
+    dst->state = src->state;
+    dst->active_conns = src->active_conns;
+    dst->total_conns = src->total_conns;
+    dst->bytes_in = src->bytes_in;
+    dst->bytes_out = src->bytes_out;
+    dst->last_health_check = src->last_health_check;
+    dst->health_fails = src->health_fails;
+    dst->tls_enabled = src->tls_enabled;
+    dst->tls_verify = src->tls_verify;
+    dst->tls_pin_enabled = src->tls_pin_enabled;
+    strncpy(dst->tls_server_name, src->tls_server_name, sizeof(dst->tls_server_name) - 1);
+    dst->tls_server_name[sizeof(dst->tls_server_name) - 1] = '\0';
+    strncpy(dst->tls_ca_path, src->tls_ca_path, sizeof(dst->tls_ca_path) - 1);
+    dst->tls_ca_path[sizeof(dst->tls_ca_path) - 1] = '\0';
+    strncpy(dst->tls_pin_sha256, src->tls_pin_sha256, sizeof(dst->tls_pin_sha256) - 1);
+    dst->tls_pin_sha256[sizeof(dst->tls_pin_sha256) - 1] = '\0';
+}
+
+static void copy_rule_no_lock(spf_rule_t* dst, const spf_rule_t* src) {
+    if (!dst || !src) {
+        return;
+    }
+
+    dst->id = src->id;
+    strncpy(dst->name, src->name, sizeof(dst->name) - 1);
+    dst->name[sizeof(dst->name) - 1] = '\0';
+    dst->listen_port = src->listen_port;
+    dst->enabled = src->enabled;
+    dst->active = src->active;
+    dst->tls_terminate = src->tls_terminate;
+    dst->lb_algo = src->lb_algo;
+    dst->backend_count = src->backend_count > SPF_MAX_BACKENDS ? SPF_MAX_BACKENDS : src->backend_count;
+    dst->rr_index = src->rr_index;
+    dst->rate_bps = src->rate_bps;
+    dst->max_conns = src->max_conns;
+    dst->listen_thread = 0;
+    dst->health_thread = 0;
+    dst->listener_started = false;
+
+    for (int i = 0; i < SPF_MAX_BACKENDS; i++) {
+        if (i < dst->backend_count) {
+            copy_backend_no_lock(&dst->backends[i], &src->backends[i]);
+        } else {
+            clear_backend_no_lock(&dst->backends[i]);
+        }
+    }
+}
+
+static bool rule_slot_reusable(spf_rule_t* rule) {
+    if (!rule) {
+        return false;
+    }
+    if (rule->active || rule->listener_started) {
+        return false;
+    }
+
+    for (int i = 0; i < SPF_MAX_BACKENDS; i++) {
+        pthread_mutex_lock(&rule->backends[i].lock);
+        uint32_t active = rule->backends[i].active_conns;
+        pthread_mutex_unlock(&rule->backends[i].lock);
+        if (active > 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int spf_add_rule(spf_state_t* state, const spf_rule_t* rule) {
     pthread_mutex_lock(&state->lock);
     
@@ -291,15 +402,17 @@ int spf_add_rule(spf_state_t* state, const spf_rule_t* rule) {
         return -1;
     }
     
+    for (int i = 0; i < SPF_MAX_RULES; i++) {
+        if (state->rules[i].active && state->rules[i].id == rule->id) {
+            pthread_mutex_unlock(&state->lock);
+            return -1;
+        }
+    }
+
     int idx = -1;
     for (int i = 0; i < SPF_MAX_RULES; i++) {
-        if (!state->rules[i].active) {
+        if (rule_slot_reusable(&state->rules[i])) {
             idx = i;
-            break;
-        }
-        if (state->rules[i].id == rule->id) {
-            idx = i;
-            state->rule_count--;
             break;
         }
     }
@@ -309,31 +422,8 @@ int spf_add_rule(spf_state_t* state, const spf_rule_t* rule) {
         return -1;
     }
     
-    // If this slot was previously used (rules are not zeroed on del), 
-    // we should technically check if we need to destroy old mutexes, 
-    // but typically we just re-init. The correct way is to not memcpy over the mutex.
-    // However, since we are reusing the *storage*, we must be careful.
-    // Let's copy field by field or memcpy and then re-init (which implementations usually tolerate if destroyed).
-    // Safer: Destroy old locks first if the rule ID was valid.
-    if (state->rules[idx].active || state->rules[idx].id != 0) {
-        pthread_mutex_destroy(&state->rules[idx].lock);
-        for (int i = 0; i < SPF_MAX_BACKENDS; i++) {
-            pthread_mutex_destroy(&state->rules[idx].backends[i].lock);
-        }
-    }
-    
-    // safe copy excluding lock would be tedious, so we assume re-init is our path
-    // but memcpy overwrites the mutex state which is UB.
-    // We will zero the destination first? No, that also wipes mutex memory.
-    // Correct C: don't overwrite the mutex object with memcpy if it's active.
-    // Since we destroyed it above, the memory is now "garbage" / "free to use".
-    memcpy(&state->rules[idx], rule, sizeof(spf_rule_t));
-    
-    // Now init valid mutexes
-    pthread_mutex_init(&state->rules[idx].lock, NULL);
-    for (int i = 0; i < state->rules[idx].backend_count; i++) {
-        pthread_mutex_init(&state->rules[idx].backends[i].lock, NULL);
-    }
+    copy_rule_no_lock(&state->rules[idx], rule);
+    state->rules[idx].epoch = ++state->next_rule_epoch;
     
     state->rules[idx].active = true;
     state->rules[idx].listener_started = false;
@@ -352,19 +442,7 @@ int spf_del_rule(spf_state_t* state, uint32_t rule_id) {
         if (state->rules[i].active && state->rules[i].id == rule_id) {
             state->rules[i].active = false;
             state->rules[i].enabled = false;
-            state->rules[i].listener_started = false;
             state->rule_count--;
-            
-            // We should destroy the mutexes to be clean, but we hold the main lock.
-            // Destroying them is fine as long as no one else is using them.
-            // Since active is false, no one should find this rule anymore (guarded by state->lock).
-            pthread_mutex_destroy(&state->rules[i].lock);
-            for (int j = 0; j < state->rules[i].backend_count; j++) {
-                pthread_mutex_destroy(&state->rules[i].backends[j].lock);
-            }
-            
-            // Mark ID as 0 to indicate free slot clearly?
-            // state->rules[i].id = 0; // We keep ID for logging/history maybe?
             
             pthread_mutex_unlock(&state->lock);
             spf_log(SPF_LOG_INFO, "rule %u deleted", rule_id);

@@ -8,6 +8,24 @@
 
 static char* trim(char* s);
 
+static bool rule_slot_reusable_config(spf_rule_t* rule) {
+    if (!rule) {
+        return false;
+    }
+    if (rule->active || rule->listener_started) {
+        return false;
+    }
+    for (int i = 0; i < SPF_MAX_BACKENDS; i++) {
+        pthread_mutex_lock(&rule->backends[i].lock);
+        uint32_t conns = rule->backends[i].active_conns;
+        pthread_mutex_unlock(&rule->backends[i].lock);
+        if (conns > 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool parse_u16_value(const char* s, uint16_t* out) {
     if (!s || !*s || !out) return false;
     char* end = NULL;
@@ -257,13 +275,19 @@ int spf_load_config(spf_state_t* state, const char* path) {
                 
                 pthread_mutex_lock(&state->lock);
                 for (int i = 0; i < SPF_MAX_RULES; i++) {
-                    if (!state->rules[i].active) {
-                        // Safe copy avoiding mutex overwrite (similar to core.c fix)
-                        if (state->rules[i].active || state->rules[i].id != 0) {
-                            pthread_mutex_destroy(&state->rules[i].lock);
-                        }
-                        memcpy(&state->rules[i], &rule, sizeof(rule));
-                        pthread_mutex_init(&state->rules[i].lock, NULL);
+                    if (rule_slot_reusable_config(&state->rules[i])) {
+                        state->rules[i].id = rule.id;
+                        state->rules[i].listen_port = rule.listen_port;
+                        state->rules[i].enabled = rule.enabled;
+                        state->rules[i].active = rule.active;
+                        state->rules[i].tls_terminate = false;
+                        state->rules[i].lb_algo = SPF_LB_ROUNDROBIN;
+                        state->rules[i].backend_count = 0;
+                        state->rules[i].rr_index = 0;
+                        state->rules[i].rate_bps = rule.rate_bps;
+                        state->rules[i].max_conns = 0;
+                        state->rules[i].epoch = ++state->next_rule_epoch;
+                        state->rules[i].listener_started = false;
                         current_rule = &state->rules[i];
                         state->rule_count++;
                         break;
@@ -274,7 +298,6 @@ int spf_load_config(spf_state_t* state, const char* path) {
             else if (strcmp(key, "backend") == 0 && current_rule) {
                 if (current_rule->backend_count < SPF_MAX_BACKENDS) {
                     parse_backend(val, &current_rule->backends[current_rule->backend_count]);
-                    pthread_mutex_init(&current_rule->backends[current_rule->backend_count].lock, NULL);
                     current_rule->backend_count++;
                 }
             }
