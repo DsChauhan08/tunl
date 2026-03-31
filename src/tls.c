@@ -133,6 +133,45 @@ SSL* tls_connect(int fd, const char* hostname) {
     return ssl;
 }
 
+SSL* tls_connect_backend(int fd, const char* hostname, const char* ca_path, bool verify_peer) {
+    if (!g_client_ctx) return NULL;
+
+    SSL* ssl = SSL_new(g_client_ctx);
+    if (!ssl) return NULL;
+
+    SSL_set_fd(ssl, fd);
+
+    if (hostname && *hostname) {
+        SSL_set_tlsext_host_name(ssl, hostname);
+    }
+
+    if (ca_path && *ca_path) {
+        if (SSL_set1_host(ssl, hostname && *hostname ? hostname : NULL) != 1) {
+            SSL_free(ssl);
+            return NULL;
+        }
+        if (SSL_CTX_load_verify_locations(g_client_ctx, ca_path, NULL) != 1) {
+            spf_log(SPF_LOG_ERROR, "tls: failed to load backend CA: %s", ca_path);
+            SSL_free(ssl);
+            return NULL;
+        }
+    }
+
+    if (verify_peer) {
+        SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
+    } else {
+        SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
+    }
+
+    if (SSL_connect(ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        return NULL;
+    }
+
+    return ssl;
+}
+
 ssize_t tls_read(SSL* ssl, void* buf, size_t len) {
     if (!ssl) return -1;
     int n = SSL_read(ssl, buf, len);

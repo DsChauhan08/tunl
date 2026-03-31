@@ -411,6 +411,7 @@ SSL_CTX* tls_get_server_ctx(void);
 SSL_CTX* tls_get_client_ctx(void);
 SSL* tls_accept(int fd);
 SSL* tls_connect(int fd, const char* hostname);
+SSL* tls_connect_backend(int fd, const char* hostname, const char* ca_path, bool verify_peer);
 ssize_t tls_read(SSL* ssl, void* buf, size_t len);
 ssize_t tls_write(SSL* ssl, const void* buf, size_t len);
 void tls_close(SSL* ssl);
