@@ -136,7 +136,31 @@ SSL* tls_connect(int fd, const char* hostname) {
 SSL* tls_connect_backend(int fd, const char* hostname, const char* ca_path, bool verify_peer) {
     if (!g_client_ctx) return NULL;
 
-    SSL* ssl = SSL_new(g_client_ctx);
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        return NULL;
+    }
+
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+
+    if (verify_peer) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        if (ca_path && *ca_path) {
+            if (SSL_CTX_load_verify_locations(ctx, ca_path, NULL) != 1) {
+                spf_log(SPF_LOG_ERROR, "tls: failed to load backend CA: %s", ca_path);
+                SSL_CTX_free(ctx);
+                return NULL;
+            }
+        } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            spf_log(SPF_LOG_WARN, "tls: could not load default backend trust store");
+        }
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+
+    SSL* ssl = SSL_new(ctx);
     if (!ssl) return NULL;
 
     SSL_set_fd(ssl, fd);
@@ -145,29 +169,22 @@ SSL* tls_connect_backend(int fd, const char* hostname, const char* ca_path, bool
         SSL_set_tlsext_host_name(ssl, hostname);
     }
 
-    if (ca_path && *ca_path) {
-        if (SSL_set1_host(ssl, hostname && *hostname ? hostname : NULL) != 1) {
+    if (verify_peer && hostname && *hostname) {
+        if (SSL_set1_host(ssl, hostname) != 1) {
+            SSL_CTX_free(ctx);
             SSL_free(ssl);
             return NULL;
         }
-        if (SSL_CTX_load_verify_locations(g_client_ctx, ca_path, NULL) != 1) {
-            spf_log(SPF_LOG_ERROR, "tls: failed to load backend CA: %s", ca_path);
-            SSL_free(ssl);
-            return NULL;
-        }
-    }
-
-    if (verify_peer) {
-        SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
-    } else {
-        SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
     }
 
     if (SSL_connect(ssl) <= 0) {
         ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
         SSL_free(ssl);
         return NULL;
     }
+
+    SSL_CTX_free(ctx);
 
     return ssl;
 }

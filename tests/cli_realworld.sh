@@ -188,7 +188,7 @@ printf '%s\n' "$DUAL_OUT" | rg -q 'max_cmds_per_min=240'
 echo "[cli] validating service token auth and temp access grants"
 TOK_OUT=$( {
   printf 'AUTH secret\n'; sleep 0.2
-  printf 'TOKENADD ci rw 15 2\n'; sleep 0.2
+  printf 'TOKENADD ci rw 15 2 svc-ci-token\n'; sleep 0.2
   printf 'TOKENLIST\n'; sleep 0.2
   printf 'ACCESSGRANT 127.0.0.2 10\n'; sleep 0.2
   printf 'ACCESSGRANTS\n'; sleep 0.2
@@ -201,11 +201,7 @@ printf '%s\n' "$TOK_OUT" | rg -q -- '--- SERVICE TOKENS ---'
 printf '%s\n' "$TOK_OUT" | rg -q 'OK temp access granted 127.0.0.2'
 printf '%s\n' "$TOK_OUT" | rg -q -- '--- TEMP ACCESS GRANTS ---'
 
-SVC_TOKEN=$(printf '%s\n' "$TOK_OUT" | rg -o 'token=[A-Za-z0-9]+' | sed 's/token=//' | head -n 1)
-if [[ -z "$SVC_TOKEN" ]]; then
-  echo "[cli] failed to parse service token"
-  exit 1
-fi
+SVC_TOKEN="svc-ci-token"
 
 SVC_AUTH_OUT=$( {
   printf 'AUTH %s\n' "$SVC_TOKEN"; sleep 0.2
@@ -243,5 +239,6 @@ echo "[cli] validating audit log entries"
 [[ -f /tmp/spf-cli-audit.log ]]
 rg -q '"prev_hash"' /tmp/spf-cli-audit.log
 rg -q '"hash"' /tmp/spf-cli-audit.log
+! rg -q 'svc-ci-token' /tmp/spf-cli-audit.log
 
 echo "[cli] real-world CLI checks passed"

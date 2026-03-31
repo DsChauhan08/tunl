@@ -257,13 +257,19 @@ int spf_load_config(spf_state_t* state, const char* path) {
                 
                 pthread_mutex_lock(&state->lock);
                 for (int i = 0; i < SPF_MAX_RULES; i++) {
-                    if (!state->rules[i].active) {
-                        // Safe copy avoiding mutex overwrite (similar to core.c fix)
-                        if (state->rules[i].active || state->rules[i].id != 0) {
-                            pthread_mutex_destroy(&state->rules[i].lock);
-                        }
-                        memcpy(&state->rules[i], &rule, sizeof(rule));
-                        pthread_mutex_init(&state->rules[i].lock, NULL);
+                    if (!state->rules[i].active && !state->rules[i].listener_started) {
+                        state->rules[i].id = rule.id;
+                        state->rules[i].listen_port = rule.listen_port;
+                        state->rules[i].enabled = rule.enabled;
+                        state->rules[i].active = rule.active;
+                        state->rules[i].tls_terminate = false;
+                        state->rules[i].lb_algo = SPF_LB_ROUNDROBIN;
+                        state->rules[i].backend_count = 0;
+                        state->rules[i].rr_index = 0;
+                        state->rules[i].rate_bps = rule.rate_bps;
+                        state->rules[i].max_conns = 0;
+                        state->rules[i].epoch = ++state->next_rule_epoch;
+                        state->rules[i].listener_started = false;
                         current_rule = &state->rules[i];
                         state->rule_count++;
                         break;

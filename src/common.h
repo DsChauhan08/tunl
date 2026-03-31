@@ -125,6 +125,7 @@ typedef struct {
     uint32_t rr_index;
     uint64_t rate_bps;
     uint32_t max_conns;
+    uint64_t epoch;
     pthread_t listen_thread;
     pthread_t health_thread;
     bool listener_started;
@@ -288,6 +289,7 @@ typedef struct {
     spf_service_token_t service_tokens[SPF_MAX_SERVICE_TOKENS];
     uint32_t next_service_token_id;
     spf_temp_admin_grant_t temp_admin_grants[SPF_MAX_TEMP_ADMIN_GRANTS];
+    uint64_t next_rule_epoch;
     spf_admin_cfg_t last_admin_snapshot;
     bool has_admin_snapshot;
     char audit_prev_hash[65];
