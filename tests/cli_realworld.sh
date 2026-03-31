@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SPF_BIN="$ROOT/bin/spf"
+SPF_BIN="${SPF_BIN:-$ROOT/bin/spf}"
 BACKEND_PY="$ROOT/fast_backend.py"
 CFG_FILE="$(mktemp /tmp/spf-cli-config.XXXXXX.conf)"
 GUARD_CFG_FILE="$(mktemp /tmp/spf-cli-guard-config.XXXXXX.conf)"

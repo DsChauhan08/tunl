@@ -8,6 +8,24 @@
 
 static char* trim(char* s);
 
+static bool rule_slot_reusable_config(spf_rule_t* rule) {
+    if (!rule) {
+        return false;
+    }
+    if (rule->active || rule->listener_started) {
+        return false;
+    }
+    for (int i = 0; i < SPF_MAX_BACKENDS; i++) {
+        pthread_mutex_lock(&rule->backends[i].lock);
+        uint32_t conns = rule->backends[i].active_conns;
+        pthread_mutex_unlock(&rule->backends[i].lock);
+        if (conns > 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool parse_u16_value(const char* s, uint16_t* out) {
     if (!s || !*s || !out) return false;
     char* end = NULL;
@@ -257,7 +275,7 @@ int spf_load_config(spf_state_t* state, const char* path) {
                 
                 pthread_mutex_lock(&state->lock);
                 for (int i = 0; i < SPF_MAX_RULES; i++) {
-                    if (!state->rules[i].active && !state->rules[i].listener_started) {
+                    if (rule_slot_reusable_config(&state->rules[i])) {
                         state->rules[i].id = rule.id;
                         state->rules[i].listen_port = rule.listen_port;
                         state->rules[i].enabled = rule.enabled;

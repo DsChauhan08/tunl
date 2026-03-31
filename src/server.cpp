@@ -121,6 +121,38 @@ static bool parse_u64_strict(const char* s, uint64_t* out) {
     return true;
 }
 
+static bool is_reasonable_service_token(const char* token) {
+    if (!token) {
+        return false;
+    }
+
+    size_t len = strlen(token);
+    if (len < 12 || len >= SPF_TOKEN_MAX) {
+        return false;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)token[i];
+        if (c <= 0x20 || c > 0x7e) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool rule_state_snapshot(spf_rule_t* rule, uint64_t* epoch, bool* active) {
+    if (!rule || !epoch || !active) {
+        return false;
+    }
+
+    pthread_mutex_lock(&g_state.lock);
+    *epoch = rule->epoch;
+    *active = rule->active;
+    pthread_mutex_unlock(&g_state.lock);
+    return true;
+}
+
 static bool secure_token_equals(const char* expected, const char* provided) {
     if (!expected || !provided || expected[0] == '\0') {
         return false;
@@ -393,7 +425,7 @@ static int service_token_add(const char* label, bool read_only, uint32_t ttl_sec
         return -1;
     }
 
-    if (preferred_token && preferred_token[0] != '\0' && strlen(preferred_token) >= SPF_TOKEN_MAX) {
+    if (preferred_token && preferred_token[0] != '\0' && !is_reasonable_service_token(preferred_token)) {
         return -1;
     }
 
@@ -1204,7 +1236,10 @@ int send_proxy_proto_v2(int fd, struct sockaddr_in* src, struct sockaddr_in* dst
 void* session_thread(void* arg) {
     session_t* s = (session_t*)arg;
 
-    if (!s->rule || s->rule->epoch != s->rule_epoch) {
+    uint64_t cur_epoch = 0;
+    bool cur_active = false;
+    if (!s->rule || !rule_state_snapshot(s->rule, &cur_epoch, &cur_active) ||
+        cur_epoch != s->rule_epoch || !cur_active) {
         if (s->client_ssl) {
             tls_close(s->client_ssl);
         }
@@ -1248,7 +1283,8 @@ void* session_thread(void* arg) {
     uint64_t bytes_in = 0, bytes_out = 0;
     
     while (!g_shutdown && g_state.running) {
-        if (!s->rule || s->rule->epoch != s->rule_epoch || !s->rule->active) {
+        if (!rule_state_snapshot(s->rule, &cur_epoch, &cur_active) ||
+            cur_epoch != s->rule_epoch || !cur_active) {
             break;
         }
         FD_ZERO(&fds);
@@ -1319,9 +1355,19 @@ void* session_thread(void* arg) {
 
 void* health_worker(void* arg) {
     spf_rule_t* rule = (spf_rule_t*)arg;
-    uint64_t epoch = rule->epoch;
-    
-    while (!g_shutdown && g_state.running && rule->active && rule->epoch == epoch) {
+    uint64_t epoch = 0;
+    bool active = false;
+    if (!rule_state_snapshot(rule, &epoch, &active) || !active) {
+        return NULL;
+    }
+
+    while (!g_shutdown && g_state.running) {
+        uint64_t cur_epoch = 0;
+        bool cur_active = false;
+        if (!rule_state_snapshot(rule, &cur_epoch, &cur_active) || !cur_active || cur_epoch != epoch) {
+            break;
+        }
+
         for (int i = 0; i < rule->backend_count; i++) {
             spf_backend_t* b = &rule->backends[i];
             if (b->state == SPF_BACKEND_DRAIN) continue;
@@ -1371,7 +1417,11 @@ void* health_worker(void* arg) {
 
 void* listener_thread(void* arg) {
     spf_rule_t* rule = (spf_rule_t*)arg;
-    uint64_t epoch = rule->epoch;
+    uint64_t epoch = 0;
+    bool active = false;
+    if (!rule_state_snapshot(rule, &epoch, &active) || !active) {
+        return NULL;
+    }
     
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
@@ -1396,7 +1446,13 @@ void* listener_thread(void* arg) {
     pthread_create(&rule->health_thread, NULL, health_worker, rule);
     pthread_detach(rule->health_thread);
     
-    while (!g_shutdown && g_state.running && rule->active && rule->epoch == epoch) {
+    while (!g_shutdown && g_state.running) {
+        uint64_t cur_epoch = 0;
+        bool cur_active = false;
+        if (!rule_state_snapshot(rule, &cur_epoch, &cur_active) || !cur_active || cur_epoch != epoch) {
+            break;
+        }
+
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
@@ -2149,6 +2205,11 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
 
                 if (!preferred_token || !preferred_token[0]) {
                     snprintf(resp, sizeof(resp), "ERR token is required\n");
+                    goto send_resp;
+                }
+
+                if (!is_reasonable_service_token(preferred_token)) {
+                    snprintf(resp, sizeof(resp), "ERR token must be 12-127 printable non-space chars\n");
                     goto send_resp;
                 }
 
