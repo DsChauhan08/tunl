@@ -4,11 +4,13 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <inttypes.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <openssl/sha.h>
+#include <ctype.h>
 
 #ifdef SPF_PLATFORM_ESP32
     #include <Arduino.h>
@@ -94,6 +96,11 @@ spf_ctrl_cmd_kind_t spf_ctrl_classify_command(const char* line) {
     if (strncmp(line, "PAUSE ", 6) == 0) return SPF_CTRL_CMD_PAUSE;
     if (strncmp(line, "RESUME ", 7) == 0) return SPF_CTRL_CMD_RESUME;
     if (strncmp(line, "DRAIN ", 6) == 0) return SPF_CTRL_CMD_DRAIN;
+    if (strncmp(line, "SETRATE ", 8) == 0) return SPF_CTRL_CMD_SETRATE;
+    if (strncmp(line, "SETMAXCONNS ", 12) == 0) return SPF_CTRL_CMD_SETMAXCONNS;
+    if (strncmp(line, "SETGLOBALMAXCONNS ", 18) == 0) return SPF_CTRL_CMD_SETGLOBALMAXCONNS;
+    if (strncmp(line, "EMERGENCY ", 10) == 0) return SPF_CTRL_CMD_EMERGENCY;
+    if (strncmp(line, "AUDITVERIFY", 11) == 0) return SPF_CTRL_CMD_AUDITVERIFY;
     if (strncmp(line, "SETWEIGHT ", 10) == 0) return SPF_CTRL_CMD_SETWEIGHT;
     if (strncmp(line, "SETSTATE ", 9) == 0) return SPF_CTRL_CMD_SETSTATE;
     if (strncmp(line, "ADMINALLOWLIST", 14) == 0) return SPF_CTRL_CMD_ADMINALLOWLIST;
@@ -233,6 +240,222 @@ void spf_audit_log(spf_state_t* state, const char* actor_ip, const char* role,
     pthread_mutex_unlock(&state->audit_lock);
 }
 
+static int extract_json_string_field(const char* line, const char* field, char* out, size_t out_len) {
+    if (!line || !field || !out || out_len == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+
+    char pat[64];
+    int pn = snprintf(pat, sizeof(pat), "\"%s\":\"", field);
+    if (pn <= 0 || (size_t)pn >= sizeof(pat)) {
+        return -1;
+    }
+
+    const char* p = strstr(line, pat);
+    if (!p) {
+        return -1;
+    }
+    p += strlen(pat);
+
+    size_t j = 0;
+    bool escaped = false;
+    for (; *p && j + 1 < out_len; p++) {
+        char c = *p;
+        if (!escaped && c == '"') {
+            break;
+        }
+
+        out[j++] = c;
+
+        if (!escaped && c == '\\') {
+            escaped = true;
+        } else {
+            escaped = false;
+        }
+    }
+    out[j] = '\0';
+    return 0;
+}
+
+static bool has_escaped_controls(const char* s) {
+    if (!s) {
+        return false;
+    }
+    for (size_t i = 0; s[i] && s[i + 1]; i++) {
+        if (s[i] == '\\' && (s[i + 1] == 'n' || s[i + 1] == 'r' || s[i + 1] == 't')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int extract_json_u64_field(const char* line, const char* field, uint64_t* out) {
+    if (!line || !field || !out) {
+        return -1;
+    }
+    char pat[64];
+    int pn = snprintf(pat, sizeof(pat), "\"%s\":", field);
+    if (pn <= 0 || (size_t)pn >= sizeof(pat)) {
+        return -1;
+    }
+    const char* p = strstr(line, pat);
+    if (!p) {
+        return -1;
+    }
+    p += strlen(pat);
+    while (*p && isspace((unsigned char)*p)) p++;
+
+    char* end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (errno != 0 || end == p) {
+        return -1;
+    }
+    *out = (uint64_t)v;
+    return 0;
+}
+
+static void json_unescape_minimal(char* s) {
+    if (!s) {
+        return;
+    }
+    size_t r = 0, w = 0;
+    while (s[r] != '\0') {
+        if (s[r] == '\\' && s[r + 1] != '\0') {
+            char n = s[r + 1];
+            if (n == 'n') s[w++] = '\n';
+            else if (n == 'r') s[w++] = '\r';
+            else if (n == 't') s[w++] = '\t';
+            else s[w++] = n;
+            r += 2;
+        } else {
+            s[w++] = s[r++];
+        }
+    }
+    s[w] = '\0';
+}
+
+int spf_audit_verify_chain(spf_state_t* state, uint32_t* entries_checked, uint32_t* failures) {
+    if (!state || !state->config.admin.audit_log_path[0]) {
+        return -1;
+    }
+
+    FILE* f = fopen(state->config.admin.audit_log_path, "r");
+    if (!f) {
+        return -1;
+    }
+
+    char line[2048];
+    char expected_prev[65] = "0000000000000000000000000000000000000000000000000000000000000000";
+    uint32_t checked = 0;
+    uint32_t bad = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        char* nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        uint64_t seq = 0, ts = 0;
+        char actor_ip[SPF_IP_MAX_LEN * 2] = {0};
+        char role[64] = {0};
+        char action[96] = {0};
+        char result[64] = {0};
+        char details[512] = {0};
+        char prev_hash[65] = {0};
+        char hash[65] = {0};
+
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (extract_json_u64_field(line, "seq", &seq) != 0 ||
+            extract_json_u64_field(line, "ts", &ts) != 0 ||
+            extract_json_string_field(line, "actor_ip", actor_ip, sizeof(actor_ip)) != 0 ||
+            extract_json_string_field(line, "role", role, sizeof(role)) != 0 ||
+            extract_json_string_field(line, "action", action, sizeof(action)) != 0 ||
+            extract_json_string_field(line, "result", result, sizeof(result)) != 0 ||
+            extract_json_string_field(line, "details", details, sizeof(details)) != 0 ||
+            extract_json_string_field(line, "prev_hash", prev_hash, sizeof(prev_hash)) != 0 ||
+            extract_json_string_field(line, "hash", hash, sizeof(hash)) != 0) {
+            bad++;
+            continue;
+        }
+
+        bool actor_had_ctrl = has_escaped_controls(actor_ip);
+        bool role_had_ctrl = has_escaped_controls(role);
+        bool action_had_ctrl = has_escaped_controls(action);
+        bool result_had_ctrl = has_escaped_controls(result);
+        bool details_had_ctrl = has_escaped_controls(details);
+
+        json_unescape_minimal(actor_ip);
+        json_unescape_minimal(role);
+        json_unescape_minimal(action);
+        json_unescape_minimal(result);
+        json_unescape_minimal(details);
+        json_unescape_minimal(prev_hash);
+        json_unescape_minimal(hash);
+
+        if (strncmp(prev_hash, expected_prev, 64) != 0) {
+            bad++;
+            strncpy(expected_prev, hash, sizeof(expected_prev) - 1);
+            expected_prev[sizeof(expected_prev) - 1] = '\0';
+            checked++;
+            continue;
+        }
+
+        char canonical[1536];
+        int n = snprintf(canonical, sizeof(canonical),
+                         "{\"seq\":%" PRIu64 ",\"ts\":%" PRIu64 ",\"actor_ip\":\"%s\",\"role\":\"%s\",\"action\":\"%s\",\"result\":\"%s\",\"details\":\"%s\",\"prev_hash\":\"%s\"}",
+                         seq, ts, actor_ip, role, action, result, details, prev_hash);
+        if (n <= 0 || (size_t)n >= sizeof(canonical)) {
+            bad++;
+            continue;
+        }
+
+        if (actor_had_ctrl || role_had_ctrl || action_had_ctrl || result_had_ctrl || details_had_ctrl) {
+            char actor_esc[SPF_IP_MAX_LEN * 2];
+            char role_esc[64];
+            char action_esc[96];
+            char result_esc[64];
+            char details_esc[512];
+            audit_json_escape(actor_ip, actor_esc, sizeof(actor_esc));
+            audit_json_escape(role, role_esc, sizeof(role_esc));
+            audit_json_escape(action, action_esc, sizeof(action_esc));
+            audit_json_escape(result, result_esc, sizeof(result_esc));
+            audit_json_escape(details, details_esc, sizeof(details_esc));
+            n = snprintf(canonical, sizeof(canonical),
+                         "{\"seq\":%" PRIu64 ",\"ts\":%" PRIu64 ",\"actor_ip\":\"%s\",\"role\":\"%s\",\"action\":\"%s\",\"result\":\"%s\",\"details\":\"%s\",\"prev_hash\":\"%s\"}",
+                         seq, ts, actor_esc, role_esc, action_esc, result_esc, details_esc, prev_hash);
+            if (n <= 0 || (size_t)n >= sizeof(canonical)) {
+                bad++;
+                continue;
+            }
+        }
+
+        unsigned char digest[SHA256_DIGEST_LENGTH];
+        SHA256((const unsigned char*)canonical, (size_t)n, digest);
+        char computed[65];
+        for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+            snprintf(computed + i * 2, 3, "%02x", digest[i]);
+        }
+        computed[64] = '\0';
+
+        if (strncmp(computed, hash, 64) != 0) {
+            bad++;
+        }
+
+        strncpy(expected_prev, hash, sizeof(expected_prev) - 1);
+        expected_prev[sizeof(expected_prev) - 1] = '\0';
+        checked++;
+    }
+
+    fclose(f);
+
+    if (entries_checked) *entries_checked = checked;
+    if (failures) *failures = bad;
+    return bad == 0 ? 0 : -1;
+}
+
 void spf_init(spf_state_t* state) {
     memset(state, 0, sizeof(spf_state_t));
     state->running = true;
@@ -267,6 +490,8 @@ void spf_init(spf_state_t* state) {
     state->config.log_level = SPF_LOG_INFO;
     state->staged_change_count = 0;
     state->has_admin_snapshot = false;
+    state->global_max_conns = SPF_MAX_CONNECTIONS;
+    state->emergency_mode = false;
 
     spf_audit_init(state);
     

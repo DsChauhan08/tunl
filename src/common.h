@@ -290,6 +290,12 @@ typedef struct {
     uint64_t backend_tls_handshake_failures;
     uint64_t backend_tls_pin_failures;
     uint64_t backend_connect_timeouts;
+    uint64_t conn_reject_emergency;
+    uint64_t conn_reject_rule_max;
+    uint64_t conn_reject_global_max;
+    uint64_t audit_verify_failures;
+    uint32_t global_max_conns;
+    bool emergency_mode;
     spf_staged_change_t staged_changes[SPF_MAX_STAGED_CHANGES];
     uint32_t staged_change_count;
     spf_service_token_t service_tokens[SPF_MAX_SERVICE_TOKENS];
@@ -319,6 +325,11 @@ typedef enum {
     SPF_CTRL_CMD_PAUSE,
     SPF_CTRL_CMD_RESUME,
     SPF_CTRL_CMD_DRAIN,
+    SPF_CTRL_CMD_SETRATE,
+    SPF_CTRL_CMD_SETMAXCONNS,
+    SPF_CTRL_CMD_SETGLOBALMAXCONNS,
+    SPF_CTRL_CMD_EMERGENCY,
+    SPF_CTRL_CMD_AUDITVERIFY,
     SPF_CTRL_CMD_SETWEIGHT,
     SPF_CTRL_CMD_SETSTATE,
     SPF_CTRL_CMD_ADMINALLOWLIST,
@@ -387,6 +398,7 @@ spf_ctrl_cmd_kind_t spf_ctrl_classify_command(const char* line);
 int spf_audit_init(spf_state_t* state);
 void spf_audit_log(spf_state_t* state, const char* actor_ip, const char* role,
                    const char* action, const char* result, const char* details);
+int spf_audit_verify_chain(spf_state_t* state, uint32_t* entries_checked, uint32_t* failures);
 
 int spf_lb_select_backend(spf_rule_t* rule, const char* client_ip);
 void spf_lb_conn_start(spf_rule_t* rule, uint8_t backend_idx);

@@ -92,6 +92,9 @@ CURL_OUT=$(curl -sS -m 3 http://127.0.0.1:18080)
 echo "[cli] running month-2/3 control checks"
 CTRL_OUT=$( {
   printf 'AUTH secret\n'; sleep 0.2
+  printf 'SETRATE %s 2097152\n' "$RULE_ID"; sleep 0.2
+  printf 'SETMAXCONNS %s 2\n' "$RULE_ID"; sleep 0.2
+  printf 'SETGLOBALMAXCONNS 1024\n'; sleep 0.2
   printf 'SETWEIGHT %s 0 3\n' "$RULE_ID"; sleep 0.2
   printf 'SETSTATE %s 0 DOWN\n' "$RULE_ID"; sleep 0.2
   printf 'SETSTATE %s 0 UP\n' "$RULE_ID"; sleep 0.2
@@ -110,6 +113,9 @@ CTRL_OUT=$( {
 echo "$CTRL_OUT"
 
 printf '%s\n' "$CTRL_OUT" | rg -q 'OK weight set'
+printf '%s\n' "$CTRL_OUT" | rg -q 'OK rate set'
+printf '%s\n' "$CTRL_OUT" | rg -q 'OK max conns set'
+printf '%s\n' "$CTRL_OUT" | rg -q 'OK global max conns'
 printf '%s\n' "$CTRL_OUT" | rg -q 'OK state set'
 printf '%s\n' "$CTRL_OUT" | rg -q 'OK paused'
 printf '%s\n' "$CTRL_OUT" | rg -q 'OK resumed'
@@ -227,13 +233,19 @@ printf '%s\n' "$TOK_DEL_OUT" | rg -q 'temp access revoked 127.0.0.2'
 echo "[cli] validating token metrics surfacing"
 TOK_METRICS=$( {
   printf 'AUTH secret\n'; sleep 0.2
+  printf 'EMERGENCY ON\n'; sleep 0.2
+  printf 'EMERGENCY OFF\n'; sleep 0.2
   printf 'METRICS\n'; sleep 0.2
+  printf 'AUDITVERIFY\n'; sleep 0.2
   printf 'QUIT\n'
 } | nc 127.0.0.1 18081 )
 
 echo "$TOK_METRICS"
 printf '%s\n' "$TOK_METRICS" | rg -q 'spf_admin_service_token_auth_success_total'
 printf '%s\n' "$TOK_METRICS" | rg -q 'spf_admin_temp_grants_created_total'
+printf '%s\n' "$TOK_METRICS" | rg -q 'spf_admin_failed_commands_total'
+printf '%s\n' "$TOK_METRICS" | rg -q 'spf_emergency_mode'
+printf '%s\n' "$TOK_METRICS" | rg -q 'OK audit chain verified entries='
 
 echo "[cli] validating audit log entries"
 [[ -f /tmp/spf-cli-audit.log ]]

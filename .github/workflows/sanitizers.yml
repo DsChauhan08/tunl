@@ -24,7 +24,7 @@ jobs:
       - name: Run tests under ASAN
         env:
           ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
-        run: make test
+        run: make test-asan
 
       - name: Build with UBSAN
         run: make clean && make ubsan
@@ -32,7 +32,7 @@ jobs:
       - name: Run tests under UBSAN
         env:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: make test
+        run: make test-ubsan
 
   fuzz-build:
     name: Fuzz Harness Build
