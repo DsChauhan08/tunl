@@ -32,6 +32,12 @@ static const metric_def_t metrics[] = {
     {"spf_admin_service_token_auth_success_total", "Successful service-token admin auth", "counter"},
     {"spf_admin_service_token_auth_fail_total", "Failed service-token admin auth", "counter"},
     {"spf_admin_temp_grants_created_total", "Temporary admin grants created", "counter"},
+    {"spf_admin_failed_commands_total", "Failed admin commands", "counter"},
+    {"spf_admin_unknown_commands_total", "Unknown admin commands", "counter"},
+    {"spf_admin_sensitive_commands_total", "Sensitive admin commands", "counter"},
+    {"spf_backend_tls_handshake_failures_total", "Backend TLS handshake failures", "counter"},
+    {"spf_backend_tls_pin_failures_total", "Backend TLS pin validation failures", "counter"},
+    {"spf_backend_connect_timeouts_total", "Backend connection timeout failures", "counter"},
     {NULL, NULL, NULL}
 };
 
@@ -73,7 +79,13 @@ int metrics_format(spf_state_t* state, char* buf, size_t len) {
         "spf_admin_service_token_auth_success_total %lu\n"
         "spf_admin_service_token_auth_fail_total %lu\n"
         "spf_admin_cmd_rate_limited_total %lu\n"
-        "spf_admin_temp_grants_created_total %lu\n",
+        "spf_admin_temp_grants_created_total %lu\n"
+        "spf_admin_failed_commands_total %lu\n"
+        "spf_admin_unknown_commands_total %lu\n"
+        "spf_admin_sensitive_commands_total %lu\n"
+        "spf_backend_tls_handshake_failures_total %lu\n"
+        "spf_backend_tls_pin_failures_total %lu\n"
+        "spf_backend_connect_timeouts_total %lu\n",
         state->active_conns,
         state->total_conns,
         state->total_bytes_in,
@@ -86,7 +98,13 @@ int metrics_format(spf_state_t* state, char* buf, size_t len) {
         state->admin_service_token_auth_success,
         state->admin_service_token_auth_fail,
         state->admin_cmd_rate_limited,
-        state->admin_temp_grants_created);
+        state->admin_temp_grants_created,
+        state->admin_failed_command_count,
+        state->admin_unknown_command_count,
+        state->admin_sensitive_cmd_count,
+        state->backend_tls_handshake_failures,
+        state->backend_tls_pin_failures,
+        state->backend_connect_timeouts);
     pthread_mutex_unlock(&state->stats_lock);
 
     for (int i = 0; i < SPF_MAX_RULES; i++) {

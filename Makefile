@@ -82,9 +82,11 @@ debug:
 
 asan:
 	@$(MAKE) BUILD_MODE=debug CC=clang CXX=clang++ CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=address -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address" TARGET=spf-asan
+	@$(MAKE) clean
 
 ubsan:
 	@$(MAKE) BUILD_MODE=debug CC=clang CXX=clang++ CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=undefined" TARGET=spf-ubsan
+	@$(MAKE) clean
 
 sanitizers: asan ubsan
 

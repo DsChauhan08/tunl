@@ -275,13 +275,12 @@ void spf_init(spf_state_t* state) {
 
 void spf_shutdown(spf_state_t* state) {
     state->running = false;
-
-    for (int i = 0; i < SPF_MAX_RULES; i++) {
-        pthread_mutex_destroy(&state->rules[i].lock);
-        for (int j = 0; j < SPF_MAX_BACKENDS; j++) {
-            pthread_mutex_destroy(&state->rules[i].backends[j].lock);
-        }
-    }
+    /*
+     * NOTE: Per-rule and per-backend mutexes are intentionally not destroyed here.
+     * Listener/session/health workers are detached and may still be exiting during
+     * shutdown. Destroying those locks while workers might still touch them is UB.
+     * Process teardown will reclaim these resources safely.
+     */
     
     pthread_mutex_destroy(&state->lock);
     pthread_mutex_destroy(&state->stats_lock);
@@ -379,6 +378,7 @@ static bool rule_slot_reusable(spf_rule_t* rule) {
     if (!rule) {
         return false;
     }
+    /* Caller must hold state->lock while checking slot reuse eligibility. */
     if (rule->active || rule->listener_started) {
         return false;
     }

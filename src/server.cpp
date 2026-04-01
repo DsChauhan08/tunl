@@ -153,6 +153,26 @@ static bool rule_state_snapshot(spf_rule_t* rule, uint64_t* epoch, bool* active)
     return true;
 }
 
+static void rule_set_listener_started(spf_rule_t* rule, bool value) {
+    if (!rule) {
+        return;
+    }
+    pthread_mutex_lock(&g_state.lock);
+    rule->listener_started = value;
+    pthread_mutex_unlock(&g_state.lock);
+}
+
+static bool rule_listener_started(spf_rule_t* rule) {
+    if (!rule) {
+        return false;
+    }
+    bool started = false;
+    pthread_mutex_lock(&g_state.lock);
+    started = rule->listener_started;
+    pthread_mutex_unlock(&g_state.lock);
+    return started;
+}
+
 static bool secure_token_equals(const char* expected, const char* provided) {
     if (!expected || !provided || expected[0] == '\0') {
         return false;
@@ -1583,11 +1603,11 @@ void* listener_thread(void* arg) {
         pthread_detach(t);
     }
     
-    pthread_mutex_lock(&g_state.lock);
-    if (rule->epoch == epoch) {
-        rule->listener_started = false;
+    uint64_t cur_epoch = 0;
+    bool cur_active = false;
+    if (rule_state_snapshot(rule, &cur_epoch, &cur_active) && cur_epoch == epoch) {
+        rule_set_listener_started(rule, false);
     }
-    pthread_mutex_unlock(&g_state.lock);
 
     close(fd);
     spf_log(SPF_LOG_INFO, "rule %u listener stopped", rule->id);
@@ -1672,12 +1692,26 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
         spf_ctrl_cmd_kind_t cmd_kind = spf_ctrl_classify_command(buf);
         const char* cmd_name = ctrl_cmd_name(cmd_kind);
 
+        if (cmd_kind == SPF_CTRL_CMD_UNKNOWN) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.admin_unknown_command_count++;
+            pthread_mutex_unlock(&g_state.stats_lock);
+        }
+
+        if (cmd_kind == SPF_CTRL_CMD_TOKENADD || cmd_kind == SPF_CTRL_CMD_TOKENDEL ||
+            cmd_kind == SPF_CTRL_CMD_ACCESSGRANT || cmd_kind == SPF_CTRL_CMD_ACCESSREVOKE ||
+            cmd_kind == SPF_CTRL_CMD_ADMINSET || cmd_kind == SPF_CTRL_CMD_ADMINALLOW ||
+            cmd_kind == SPF_CTRL_CMD_ADMINDENY) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.admin_sensitive_cmd_count++;
+            pthread_mutex_unlock(&g_state.stats_lock);
+        }
+
         if (!admin_tracker_allow_cmd(src_ip, spf_time_sec(), g_state.config.admin.max_cmds_per_min)) {
             pthread_mutex_lock(&g_state.stats_lock);
             g_state.admin_cmd_rate_limited++;
             pthread_mutex_unlock(&g_state.stats_lock);
             spf_event_push(&g_state, SPF_EVENT_ADMIN_RATE_LIMIT, src_ip, 0, 0, "admin cmd rate limited");
-            spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "rate limit exceeded");
             if (!ctrl_send(fd, ssl, "ERR rate limit exceeded\n> ")) {
                 break;
             }
@@ -1700,16 +1734,13 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                     role = ADMIN_ROLE_ADMIN;
                     admin_tracker_auth_success(src_ip, spf_time_sec());
                     snprintf(resp, sizeof(resp), "OK authenticated admin\n");
-                    spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "ok", "authenticated admin");
                 } else if (secure_token_equals(g_state.config.admin.readonly_token, provided)) {
                     role = ADMIN_ROLE_READONLY;
                     admin_tracker_auth_success(src_ip, spf_time_sec());
                     snprintf(resp, sizeof(resp), "OK authenticated readonly\n");
-                    spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "ok", "authenticated readonly");
                 } else if (service_token_try_auth(provided, src_ip, &role)) {
                     admin_tracker_auth_success(src_ip, spf_time_sec());
                     snprintf(resp, sizeof(resp), "OK authenticated service token (%s)\n", admin_role_str(role));
-                    spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "ok", "authenticated service token");
                 } else {
                     uint32_t lockout_for = 0;
                     bool locked = admin_tracker_auth_fail(
@@ -1730,17 +1761,14 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                     if (locked) {
                         spf_event_push(&g_state, SPF_EVENT_ADMIN_LOCKOUT, src_ip, 0, 0, "admin locked due to auth failures");
                         snprintf(resp, sizeof(resp), "ERR bad token; locked %u sec\n", lockout_for);
-                        spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "bad token lockout");
                     } else {
                         snprintf(resp, sizeof(resp), "ERR bad token\n");
-                        spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "bad token");
                     }
                 }
             }
         }
         else if (role == ADMIN_ROLE_NONE) {
             snprintf(resp, sizeof(resp), "ERR auth required\n");
-            spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "auth required");
         }
         else if ((role == ADMIN_ROLE_READONLY ||
                   (g_state.config.admin.read_only_mode &&
@@ -1748,7 +1776,6 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                    strncmp(buf, "ROLLBACK", 8) != 0)) &&
                  is_write_command(buf)) {
             snprintf(resp, sizeof(resp), "ERR readonly session\n");
-            spf_audit_log(&g_state, src_ip, admin_role_str(role), cmd_name, "err", "readonly session");
         }
         else if (strncmp(buf, "HELP", 4) == 0) {
             snprintf(resp, sizeof(resp),
@@ -1906,14 +1933,18 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                     if (spf_add_rule(&g_state, &rule) == 0) {
                         spf_rule_t* added = spf_get_rule(&g_state, rule.id);
                         if (added) {
-                            if (!added->listener_started) {
-                                if (pthread_create(&added->listen_thread, NULL, listener_thread, added) == 0) {
-                                    pthread_detach(added->listen_thread);
-                                    added->listener_started = true;
-                                } else {
-                                    snprintf(resp, sizeof(resp), "ERR failed to start listener\n");
-                                    goto send_resp;
-                                }
+                            uint64_t epoch = 0;
+                            bool active = false;
+                            if (!rule_state_snapshot(added, &epoch, &active) || !active || rule_listener_started(added)) {
+                                snprintf(resp, sizeof(resp), "ERR failed to start listener\n");
+                                goto send_resp;
+                            }
+                            if (pthread_create(&added->listen_thread, NULL, listener_thread, added) == 0) {
+                                pthread_detach(added->listen_thread);
+                                rule_set_listener_started(added, true);
+                            } else {
+                                snprintf(resp, sizeof(resp), "ERR failed to start listener\n");
+                                goto send_resp;
                             }
                             snprintf(resp, sizeof(resp), "OK rule %u added\n", rule.id);
                         } else {
@@ -2447,6 +2478,13 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
         }
         char audit_details[SPF_RES_MAX_LEN];
         sanitize_audit_details(resp, audit_details, sizeof(audit_details));
+
+        if (strncmp(resp, "ERR", 3) == 0) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.admin_failed_command_count++;
+            pthread_mutex_unlock(&g_state.stats_lock);
+        }
+
         spf_audit_log(&g_state,
                       src_ip,
                       admin_role_str(role),
@@ -2777,7 +2815,7 @@ int main(int argc, char** argv) {
             spf_log(SPF_LOG_ERROR, "failed to start listener for rule %u", g_state.rules[i].id);
         } else {
             pthread_detach(g_state.rules[i].listen_thread);
-            g_state.rules[i].listener_started = true;
+            rule_set_listener_started(&g_state.rules[i], true);
         }
     }
     
