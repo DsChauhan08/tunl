@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/select.h>
@@ -858,6 +859,14 @@ static void release_conn_slot(uint32_t conn_idx, bool rollback_total) {
     pthread_mutex_unlock(&g_state.stats_lock);
 }
 
+static void rollback_conn_reservation(void) {
+    pthread_mutex_lock(&g_state.stats_lock);
+    if (g_state.active_conns > 0) {
+        g_state.active_conns--;
+    }
+    pthread_mutex_unlock(&g_state.stats_lock);
+}
+
 static bool parse_u16_strict(const char* s, uint16_t* out) {
     if (!s || !*s || !out) {
         return false;
@@ -1111,6 +1120,13 @@ static bool try_accept_new_conn(spf_rule_t* rule) {
         return false;
     }
 
+    uint32_t rule_max_conns = 0;
+    int backend_count = 0;
+    pthread_mutex_lock(&rule->lock);
+    rule_max_conns = rule->max_conns;
+    backend_count = rule->backend_count;
+    pthread_mutex_unlock(&rule->lock);
+
     pthread_mutex_lock(&g_state.stats_lock);
     if (g_state.emergency_mode) {
         g_state.conn_reject_emergency++;
@@ -1122,17 +1138,21 @@ static bool try_accept_new_conn(spf_rule_t* rule) {
         pthread_mutex_unlock(&g_state.stats_lock);
         return false;
     }
+    g_state.active_conns++;
     pthread_mutex_unlock(&g_state.stats_lock);
 
-    if (rule->max_conns > 0) {
+    if (rule_max_conns > 0) {
         uint32_t sum = 0;
-        for (int i = 0; i < rule->backend_count; i++) {
+        for (int i = 0; i < backend_count; i++) {
             pthread_mutex_lock(&rule->backends[i].lock);
             sum += rule->backends[i].active_conns;
             pthread_mutex_unlock(&rule->backends[i].lock);
         }
-        if (sum >= rule->max_conns) {
+        if (sum >= rule_max_conns) {
             pthread_mutex_lock(&g_state.stats_lock);
+            if (g_state.active_conns > 0) {
+                g_state.active_conns--;
+            }
             g_state.conn_reject_rule_max++;
             pthread_mutex_unlock(&g_state.stats_lock);
             return false;
@@ -1601,11 +1621,13 @@ void* listener_thread(void* arg) {
         
         if (g_state.config.security.enabled) {
             if (spf_is_blocked(&g_state, cli_ip)) {
+                rollback_conn_reservation();
                 close(cli_fd);
                 continue;
             }
             
             if (!spf_register_attempt(&g_state, cli_ip)) {
+                rollback_conn_reservation();
                 close(cli_fd);
                 continue;
             }
@@ -1613,6 +1635,7 @@ void* listener_thread(void* arg) {
         
         if (g_state.config.security.enabled && spf_geoip_is_blocked(&g_state, cli_ip)) {
             spf_event_push(&g_state, SPF_EVENT_GEOBLOCK, cli_ip, ntohs(cli_addr.sin_port), rule->id, "geo blocked");
+            rollback_conn_reservation();
             close(cli_fd);
             continue;
         }
@@ -1620,6 +1643,7 @@ void* listener_thread(void* arg) {
         int backend_idx = spf_lb_select_backend(rule, cli_ip);
         if (backend_idx < 0) {
             spf_log(SPF_LOG_WARN, "no healthy backend for rule %u", rule->id);
+            rollback_conn_reservation();
             close(cli_fd);
             continue;
         }
@@ -1634,6 +1658,7 @@ void* listener_thread(void* arg) {
         SSL* target_ssl = NULL;
         int tgt_fd = dial_backend_socket(b, &tgt_addr, &target_ssl);
         if (tgt_fd < 0) {
+            rollback_conn_reservation();
             close(cli_fd);
             continue;
         }
@@ -1652,6 +1677,7 @@ void* listener_thread(void* arg) {
         }
         if (conn_idx < 0) {
             pthread_mutex_unlock(&g_state.stats_lock);
+            rollback_conn_reservation();
             close(tgt_fd);
             close(cli_fd);
             continue;
@@ -1664,7 +1690,6 @@ void* listener_thread(void* arg) {
         g_state.connections[conn_idx].rule_id = rule->id;
         g_state.connections[conn_idx].backend_idx = backend_idx;
         g_state.connections[conn_idx].start_time = spf_time_sec();
-        g_state.active_conns++;
         g_state.total_conns++;
         pthread_mutex_unlock(&g_state.stats_lock);
         
@@ -2145,14 +2170,18 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
         else if (strncmp(buf, "SETRATE ", 8) == 0) {
             uint32_t id = 0;
             uint64_t bps = 0;
-            if (sscanf(buf + 8, "%u %lu", &id, &bps) == 2) {
+            char id_s[32] = {0};
+            char bps_s[32] = {0};
+            if (sscanf(buf + 8, "%31s %31s", id_s, bps_s) == 2 &&
+                parse_u32_strict(id_s, &id) &&
+                parse_u64_strict(bps_s, &bps)) {
                 spf_rule_t* r = spf_get_rule(&g_state, id);
                 if (!r) {
                     snprintf(resp, sizeof(resp), "ERR rule not found\n");
                 } else if (bps == 0 || rule_set_rate_limit(r, bps) != 0) {
                     snprintf(resp, sizeof(resp), "ERR invalid rate\n");
                 } else {
-                    snprintf(resp, sizeof(resp), "OK rate set rule=%u bps=%lu\n", id, bps);
+                    snprintf(resp, sizeof(resp), "OK rate set rule=%u bps=%" PRIu64 "\n", id, bps);
                 }
             } else {
                 snprintf(resp, sizeof(resp), "ERR usage: SETRATE <id> <bps>\n");

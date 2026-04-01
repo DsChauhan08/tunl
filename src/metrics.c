@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <inttypes.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -74,28 +75,28 @@ int metrics_format(spf_state_t* state, char* buf, size_t len) {
     }
     written += snprintf(buf + written, len - written,
         "spf_connections_active %u\n"
-        "spf_connections_total %lu\n"
-        "spf_bytes_in_total %lu\n"
-        "spf_bytes_out_total %lu\n"
-        "spf_blocked_total %lu\n"
+        "spf_connections_total %" PRIu64 "\n"
+        "spf_bytes_in_total %" PRIu64 "\n"
+        "spf_bytes_out_total %" PRIu64 "\n"
+        "spf_blocked_total %" PRIu64 "\n"
         "spf_rules_active %u\n"
-        "spf_uptime_seconds %lu\n"
-        "spf_admin_auth_failures_total %lu\n"
-        "spf_admin_lockouts_total %lu\n"
-        "spf_admin_service_token_auth_success_total %lu\n"
-        "spf_admin_service_token_auth_fail_total %lu\n"
-        "spf_admin_cmd_rate_limited_total %lu\n"
-        "spf_admin_temp_grants_created_total %lu\n"
-        "spf_admin_failed_commands_total %lu\n"
-        "spf_admin_unknown_commands_total %lu\n"
-        "spf_admin_sensitive_commands_total %lu\n"
-        "spf_backend_tls_handshake_failures_total %lu\n"
-        "spf_backend_tls_pin_failures_total %lu\n"
-        "spf_backend_connect_timeouts_total %lu\n"
-        "spf_conn_reject_emergency_total %lu\n"
-        "spf_conn_reject_rule_max_total %lu\n"
-        "spf_conn_reject_global_max_total %lu\n"
-        "spf_audit_verify_failures_total %lu\n"
+        "spf_uptime_seconds %" PRIu64 "\n"
+        "spf_admin_auth_failures_total %" PRIu64 "\n"
+        "spf_admin_lockouts_total %" PRIu64 "\n"
+        "spf_admin_service_token_auth_success_total %" PRIu64 "\n"
+        "spf_admin_service_token_auth_fail_total %" PRIu64 "\n"
+        "spf_admin_cmd_rate_limited_total %" PRIu64 "\n"
+        "spf_admin_temp_grants_created_total %" PRIu64 "\n"
+        "spf_admin_failed_commands_total %" PRIu64 "\n"
+        "spf_admin_unknown_commands_total %" PRIu64 "\n"
+        "spf_admin_sensitive_commands_total %" PRIu64 "\n"
+        "spf_backend_tls_handshake_failures_total %" PRIu64 "\n"
+        "spf_backend_tls_pin_failures_total %" PRIu64 "\n"
+        "spf_backend_connect_timeouts_total %" PRIu64 "\n"
+        "spf_conn_reject_emergency_total %" PRIu64 "\n"
+        "spf_conn_reject_rule_max_total %" PRIu64 "\n"
+        "spf_conn_reject_global_max_total %" PRIu64 "\n"
+        "spf_audit_verify_failures_total %" PRIu64 "\n"
         "spf_global_max_conns %u\n"
         "spf_emergency_mode %u\n",
         state->active_conns,

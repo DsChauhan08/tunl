@@ -278,18 +278,6 @@ static int extract_json_string_field(const char* line, const char* field, char* 
     return 0;
 }
 
-static bool has_escaped_controls(const char* s) {
-    if (!s) {
-        return false;
-    }
-    for (size_t i = 0; s[i] && s[i + 1]; i++) {
-        if (s[i] == '\\' && (s[i + 1] == 'n' || s[i + 1] == 'r' || s[i + 1] == 't')) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static int extract_json_u64_field(const char* line, const char* field, uint64_t* out) {
     if (!line || !field || !out) {
         return -1;
@@ -316,33 +304,15 @@ static int extract_json_u64_field(const char* line, const char* field, uint64_t*
     return 0;
 }
 
-static void json_unescape_minimal(char* s) {
-    if (!s) {
-        return;
-    }
-    size_t r = 0, w = 0;
-    while (s[r] != '\0') {
-        if (s[r] == '\\' && s[r + 1] != '\0') {
-            char n = s[r + 1];
-            if (n == 'n') s[w++] = '\n';
-            else if (n == 'r') s[w++] = '\r';
-            else if (n == 't') s[w++] = '\t';
-            else s[w++] = n;
-            r += 2;
-        } else {
-            s[w++] = s[r++];
-        }
-    }
-    s[w] = '\0';
-}
-
 int spf_audit_verify_chain(spf_state_t* state, uint32_t* entries_checked, uint32_t* failures) {
     if (!state || !state->config.admin.audit_log_path[0]) {
         return -1;
     }
 
+    pthread_mutex_lock(&state->audit_lock);
     FILE* f = fopen(state->config.admin.audit_log_path, "r");
     if (!f) {
+        pthread_mutex_unlock(&state->audit_lock);
         return -1;
     }
 
@@ -381,20 +351,6 @@ int spf_audit_verify_chain(spf_state_t* state, uint32_t* entries_checked, uint32
             continue;
         }
 
-        bool actor_had_ctrl = has_escaped_controls(actor_ip);
-        bool role_had_ctrl = has_escaped_controls(role);
-        bool action_had_ctrl = has_escaped_controls(action);
-        bool result_had_ctrl = has_escaped_controls(result);
-        bool details_had_ctrl = has_escaped_controls(details);
-
-        json_unescape_minimal(actor_ip);
-        json_unescape_minimal(role);
-        json_unescape_minimal(action);
-        json_unescape_minimal(result);
-        json_unescape_minimal(details);
-        json_unescape_minimal(prev_hash);
-        json_unescape_minimal(hash);
-
         if (strncmp(prev_hash, expected_prev, 64) != 0) {
             bad++;
             strncpy(expected_prev, hash, sizeof(expected_prev) - 1);
@@ -410,26 +366,6 @@ int spf_audit_verify_chain(spf_state_t* state, uint32_t* entries_checked, uint32
         if (n <= 0 || (size_t)n >= sizeof(canonical)) {
             bad++;
             continue;
-        }
-
-        if (actor_had_ctrl || role_had_ctrl || action_had_ctrl || result_had_ctrl || details_had_ctrl) {
-            char actor_esc[SPF_IP_MAX_LEN * 2];
-            char role_esc[64];
-            char action_esc[96];
-            char result_esc[64];
-            char details_esc[512];
-            audit_json_escape(actor_ip, actor_esc, sizeof(actor_esc));
-            audit_json_escape(role, role_esc, sizeof(role_esc));
-            audit_json_escape(action, action_esc, sizeof(action_esc));
-            audit_json_escape(result, result_esc, sizeof(result_esc));
-            audit_json_escape(details, details_esc, sizeof(details_esc));
-            n = snprintf(canonical, sizeof(canonical),
-                         "{\"seq\":%" PRIu64 ",\"ts\":%" PRIu64 ",\"actor_ip\":\"%s\",\"role\":\"%s\",\"action\":\"%s\",\"result\":\"%s\",\"details\":\"%s\",\"prev_hash\":\"%s\"}",
-                         seq, ts, actor_esc, role_esc, action_esc, result_esc, details_esc, prev_hash);
-            if (n <= 0 || (size_t)n >= sizeof(canonical)) {
-                bad++;
-                continue;
-            }
         }
 
         unsigned char digest[SHA256_DIGEST_LENGTH];
@@ -450,6 +386,7 @@ int spf_audit_verify_chain(spf_state_t* state, uint32_t* entries_checked, uint32
     }
 
     fclose(f);
+    pthread_mutex_unlock(&state->audit_lock);
 
     if (entries_checked) *entries_checked = checked;
     if (failures) *failures = bad;
