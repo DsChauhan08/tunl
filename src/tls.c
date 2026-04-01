@@ -99,9 +99,8 @@ static SSL_CTX* backend_ctx_get(const char* ca_path, bool verify_peer) {
 
     if (insert_slot < 0) {
         pthread_mutex_unlock(&g_backend_ctx_cache_lock);
-        SSL_CTX_free(created);
-        spf_log(SPF_LOG_ERROR, "tls: backend ctx cache exhausted");
-        return NULL;
+        spf_log(SPF_LOG_ERROR, "tls: backend ctx cache exhausted; using uncached backend ctx");
+        return created;
     }
 
     g_backend_ctx_cache[insert_slot].in_use = true;

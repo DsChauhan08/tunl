@@ -162,15 +162,35 @@ static void rule_set_listener_started(spf_rule_t* rule, bool value) {
     pthread_mutex_unlock(&g_state.lock);
 }
 
-static bool rule_listener_started(spf_rule_t* rule) {
+static bool rule_clear_listener_started_if_epoch(spf_rule_t* rule, uint64_t epoch) {
     if (!rule) {
         return false;
     }
-    bool started = false;
+    bool cleared = false;
     pthread_mutex_lock(&g_state.lock);
-    started = rule->listener_started;
+    if (rule->epoch == epoch) {
+        rule->listener_started = false;
+        cleared = true;
+    }
     pthread_mutex_unlock(&g_state.lock);
-    return started;
+    return cleared;
+}
+
+static bool rule_mark_listener_started(spf_rule_t* rule, uint64_t* epoch) {
+    if (!rule) {
+        return false;
+    }
+    bool marked = false;
+    pthread_mutex_lock(&g_state.lock);
+    if (rule->active && !rule->listener_started) {
+        rule->listener_started = true;
+        if (epoch) {
+            *epoch = rule->epoch;
+        }
+        marked = true;
+    }
+    pthread_mutex_unlock(&g_state.lock);
+    return marked;
 }
 
 static bool secure_token_equals(const char* expected, const char* provided) {
@@ -1183,6 +1203,9 @@ static bool tls_verify_backend(spf_backend_t* backend, SSL* ssl) {
 
     if (backend->tls_pin_enabled && backend->tls_pin_sha256[0]) {
         if (tls_verify_peer_pin_sha256(ssl, backend->tls_pin_sha256) != 0) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.backend_tls_pin_failures++;
+            pthread_mutex_unlock(&g_state.stats_lock);
             spf_log(SPF_LOG_ERROR, "backend tls pin verify failed");
             return false;
         }
@@ -1208,6 +1231,11 @@ static int dial_backend_socket(spf_backend_t* backend, struct sockaddr_in* tgt_a
     setsockopt(tgt_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_conn, sizeof(tv_conn));
 
     if (connect(tgt_fd, (struct sockaddr*)tgt_addr, sizeof(*tgt_addr)) < 0) {
+        if (errno == ETIMEDOUT) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.backend_connect_timeouts++;
+            pthread_mutex_unlock(&g_state.stats_lock);
+        }
         close(tgt_fd);
         return -1;
     }
@@ -1220,6 +1248,9 @@ static int dial_backend_socket(spf_backend_t* backend, struct sockaddr_in* tgt_a
     const char* ca_path = (backend->tls_verify && backend->tls_ca_path[0]) ? backend->tls_ca_path : NULL;
     SSL* tls = tls_connect_backend(tgt_fd, sni, ca_path, backend->tls_verify);
     if (!tls) {
+        pthread_mutex_lock(&g_state.stats_lock);
+        g_state.backend_tls_handshake_failures++;
+        pthread_mutex_unlock(&g_state.stats_lock);
         close(tgt_fd);
         return -1;
     }
@@ -1603,11 +1634,7 @@ void* listener_thread(void* arg) {
         pthread_detach(t);
     }
     
-    uint64_t cur_epoch = 0;
-    bool cur_active = false;
-    if (rule_state_snapshot(rule, &cur_epoch, &cur_active) && cur_epoch == epoch) {
-        rule_set_listener_started(rule, false);
-    }
+    rule_clear_listener_started_if_epoch(rule, epoch);
 
     close(fd);
     spf_log(SPF_LOG_INFO, "rule %u listener stopped", rule->id);
@@ -1934,15 +1961,14 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                         spf_rule_t* added = spf_get_rule(&g_state, rule.id);
                         if (added) {
                             uint64_t epoch = 0;
-                            bool active = false;
-                            if (!rule_state_snapshot(added, &epoch, &active) || !active || rule_listener_started(added)) {
+                            if (!rule_mark_listener_started(added, &epoch)) {
                                 snprintf(resp, sizeof(resp), "ERR failed to start listener\n");
                                 goto send_resp;
                             }
                             if (pthread_create(&added->listen_thread, NULL, listener_thread, added) == 0) {
                                 pthread_detach(added->listen_thread);
-                                rule_set_listener_started(added, true);
                             } else {
+                                rule_clear_listener_started_if_epoch(added, epoch);
                                 snprintf(resp, sizeof(resp), "ERR failed to start listener\n");
                                 goto send_resp;
                             }
