@@ -74,17 +74,40 @@ static SSL_CTX* backend_ctx_get(const char* ca_path, bool verify_peer) {
         return NULL;
     }
 
+    pthread_mutex_unlock(&g_backend_ctx_cache_lock);
+
     SSL_CTX* created = backend_ctx_create(path, verify_peer);
     if (!created) {
-        pthread_mutex_unlock(&g_backend_ctx_cache_lock);
         return NULL;
     }
 
-    g_backend_ctx_cache[free_slot].in_use = true;
-    g_backend_ctx_cache[free_slot].verify_peer = verify_peer;
-    g_backend_ctx_cache[free_slot].ctx = created;
-    strncpy(g_backend_ctx_cache[free_slot].ca_path, path, SPF_PATH_MAX - 1);
-    g_backend_ctx_cache[free_slot].ca_path[SPF_PATH_MAX - 1] = '\0';
+    pthread_mutex_lock(&g_backend_ctx_cache_lock);
+    int insert_slot = -1;
+    for (int i = 0; i < SPF_BACKEND_CTX_CACHE_SIZE; i++) {
+        if (g_backend_ctx_cache[i].in_use) {
+            if (g_backend_ctx_cache[i].verify_peer == verify_peer &&
+                strcmp(g_backend_ctx_cache[i].ca_path, path) == 0) {
+                SSL_CTX* hit = g_backend_ctx_cache[i].ctx;
+                pthread_mutex_unlock(&g_backend_ctx_cache_lock);
+                SSL_CTX_free(created);
+                return hit;
+            }
+        } else if (insert_slot < 0) {
+            insert_slot = i;
+        }
+    }
+
+    if (insert_slot < 0) {
+        pthread_mutex_unlock(&g_backend_ctx_cache_lock);
+        spf_log(SPF_LOG_ERROR, "tls: backend ctx cache exhausted; using uncached backend ctx");
+        return created;
+    }
+
+    g_backend_ctx_cache[insert_slot].in_use = true;
+    g_backend_ctx_cache[insert_slot].verify_peer = verify_peer;
+    g_backend_ctx_cache[insert_slot].ctx = created;
+    strncpy(g_backend_ctx_cache[insert_slot].ca_path, path, SPF_PATH_MAX - 1);
+    g_backend_ctx_cache[insert_slot].ca_path[SPF_PATH_MAX - 1] = '\0';
 
     pthread_mutex_unlock(&g_backend_ctx_cache_lock);
     return created;
@@ -320,16 +343,6 @@ int tls_set_client_ca(const char* ca_path) {
     }
 
     spf_log(SPF_LOG_INFO, "tls: loaded client CA bundle");
-    return 0;
-}
-
-int tls_set_backend_trust(const char* ca_path) {
-    if (!g_client_ctx || !ca_path || !*ca_path) return -1;
-    if (SSL_CTX_load_verify_locations(g_client_ctx, ca_path, NULL) != 1) {
-        spf_log(SPF_LOG_ERROR, "tls: failed to load backend CA: %s", ca_path);
-        return -1;
-    }
-    SSL_CTX_set_verify(g_client_ctx, SSL_VERIFY_PEER, NULL);
     return 0;
 }
 
