@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/select.h>
@@ -221,6 +222,10 @@ static bool is_write_command(const char* cmd) {
            strncmp(cmd, "PAUSE ", 6) == 0 ||
            strncmp(cmd, "RESUME ", 7) == 0 ||
            strncmp(cmd, "DRAIN ", 6) == 0 ||
+           strncmp(cmd, "SETRATE ", 8) == 0 ||
+           strncmp(cmd, "SETMAXCONNS ", 12) == 0 ||
+           strncmp(cmd, "SETGLOBALMAXCONNS ", 18) == 0 ||
+           strncmp(cmd, "EMERGENCY ", 10) == 0 ||
            strncmp(cmd, "SETWEIGHT ", 10) == 0 ||
            strncmp(cmd, "SETSTATE ", 9) == 0 ||
            strncmp(cmd, "ADMINALLOW ", 11) == 0 ||
@@ -256,6 +261,11 @@ static const char* ctrl_cmd_name(spf_ctrl_cmd_kind_t kind) {
         case SPF_CTRL_CMD_PAUSE: return "PAUSE";
         case SPF_CTRL_CMD_RESUME: return "RESUME";
         case SPF_CTRL_CMD_DRAIN: return "DRAIN";
+        case SPF_CTRL_CMD_SETRATE: return "SETRATE";
+        case SPF_CTRL_CMD_SETMAXCONNS: return "SETMAXCONNS";
+        case SPF_CTRL_CMD_SETGLOBALMAXCONNS: return "SETGLOBALMAXCONNS";
+        case SPF_CTRL_CMD_EMERGENCY: return "EMERGENCY";
+        case SPF_CTRL_CMD_AUDITVERIFY: return "AUDITVERIFY";
         case SPF_CTRL_CMD_SETWEIGHT: return "SETWEIGHT";
         case SPF_CTRL_CMD_SETSTATE: return "SETSTATE";
         case SPF_CTRL_CMD_ADMINALLOWLIST: return "ADMINALLOWLIST";
@@ -849,6 +859,14 @@ static void release_conn_slot(uint32_t conn_idx, bool rollback_total) {
     pthread_mutex_unlock(&g_state.stats_lock);
 }
 
+static void rollback_conn_reservation(void) {
+    pthread_mutex_lock(&g_state.stats_lock);
+    if (g_state.active_conns > 0) {
+        g_state.active_conns--;
+    }
+    pthread_mutex_unlock(&g_state.stats_lock);
+}
+
 static bool parse_u16_strict(const char* s, uint16_t* out) {
     if (!s || !*s || !out) {
         return false;
@@ -1077,6 +1095,73 @@ static int rule_backend_drain(spf_rule_t* rule, uint8_t idx, uint32_t timeout_se
     }
 }
 
+static int rule_set_rate_limit(spf_rule_t* rule, uint64_t rate_bps) {
+    if (!rule || rate_bps == 0) {
+        return -1;
+    }
+    pthread_mutex_lock(&rule->lock);
+    rule->rate_bps = rate_bps;
+    pthread_mutex_unlock(&rule->lock);
+    return 0;
+}
+
+static int rule_set_max_conns(spf_rule_t* rule, uint32_t max_conns) {
+    if (!rule) {
+        return -1;
+    }
+    pthread_mutex_lock(&rule->lock);
+    rule->max_conns = max_conns;
+    pthread_mutex_unlock(&rule->lock);
+    return 0;
+}
+
+static bool try_accept_new_conn(spf_rule_t* rule) {
+    if (!rule) {
+        return false;
+    }
+
+    uint32_t rule_max_conns = 0;
+    int backend_count = 0;
+    pthread_mutex_lock(&rule->lock);
+    rule_max_conns = rule->max_conns;
+    backend_count = rule->backend_count;
+    pthread_mutex_unlock(&rule->lock);
+
+    pthread_mutex_lock(&g_state.stats_lock);
+    if (g_state.emergency_mode) {
+        g_state.conn_reject_emergency++;
+        pthread_mutex_unlock(&g_state.stats_lock);
+        return false;
+    }
+    if (g_state.global_max_conns > 0 && g_state.active_conns >= g_state.global_max_conns) {
+        g_state.conn_reject_global_max++;
+        pthread_mutex_unlock(&g_state.stats_lock);
+        return false;
+    }
+    g_state.active_conns++;
+    pthread_mutex_unlock(&g_state.stats_lock);
+
+    if (rule_max_conns > 0) {
+        uint32_t sum = 0;
+        for (int i = 0; i < backend_count; i++) {
+            pthread_mutex_lock(&rule->backends[i].lock);
+            sum += rule->backends[i].active_conns;
+            pthread_mutex_unlock(&rule->backends[i].lock);
+        }
+        if (sum >= rule_max_conns) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            if (g_state.active_conns > 0) {
+                g_state.active_conns--;
+            }
+            g_state.conn_reject_rule_max++;
+            pthread_mutex_unlock(&g_state.stats_lock);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static int save_runtime_config(void) {
     const char* path = g_state.config.config_path[0] ? g_state.config.config_path : "spf.conf";
     return config_save(&g_state, path);
@@ -1256,6 +1341,11 @@ static int dial_backend_socket(spf_backend_t* backend, struct sockaddr_in* tgt_a
     }
 
     if (!tls_verify_backend(backend, tls)) {
+        if (backend->tls_pin_enabled && backend->tls_pin_sha256[0]) {
+            pthread_mutex_lock(&g_state.stats_lock);
+            g_state.backend_tls_pin_failures++;
+            pthread_mutex_unlock(&g_state.stats_lock);
+        }
         tls_close(tls);
         close(tgt_fd);
         return -1;
@@ -1515,6 +1605,11 @@ void* listener_thread(void* arg) {
         socklen_t cli_len = sizeof(cli_addr);
         int cli_fd = accept(fd, (struct sockaddr*)&cli_addr, &cli_len);
         if (cli_fd < 0) continue;
+
+        if (!try_accept_new_conn(rule)) {
+            close(cli_fd);
+            continue;
+        }
         
         // Fix DoS: Set timeouts immediately to prevent slow handshake hanging the listener
         struct timeval tv_cli = {10, 0}; // 10s timeout
@@ -1526,11 +1621,13 @@ void* listener_thread(void* arg) {
         
         if (g_state.config.security.enabled) {
             if (spf_is_blocked(&g_state, cli_ip)) {
+                rollback_conn_reservation();
                 close(cli_fd);
                 continue;
             }
             
             if (!spf_register_attempt(&g_state, cli_ip)) {
+                rollback_conn_reservation();
                 close(cli_fd);
                 continue;
             }
@@ -1538,6 +1635,7 @@ void* listener_thread(void* arg) {
         
         if (g_state.config.security.enabled && spf_geoip_is_blocked(&g_state, cli_ip)) {
             spf_event_push(&g_state, SPF_EVENT_GEOBLOCK, cli_ip, ntohs(cli_addr.sin_port), rule->id, "geo blocked");
+            rollback_conn_reservation();
             close(cli_fd);
             continue;
         }
@@ -1545,6 +1643,7 @@ void* listener_thread(void* arg) {
         int backend_idx = spf_lb_select_backend(rule, cli_ip);
         if (backend_idx < 0) {
             spf_log(SPF_LOG_WARN, "no healthy backend for rule %u", rule->id);
+            rollback_conn_reservation();
             close(cli_fd);
             continue;
         }
@@ -1559,6 +1658,7 @@ void* listener_thread(void* arg) {
         SSL* target_ssl = NULL;
         int tgt_fd = dial_backend_socket(b, &tgt_addr, &target_ssl);
         if (tgt_fd < 0) {
+            rollback_conn_reservation();
             close(cli_fd);
             continue;
         }
@@ -1577,6 +1677,7 @@ void* listener_thread(void* arg) {
         }
         if (conn_idx < 0) {
             pthread_mutex_unlock(&g_state.stats_lock);
+            rollback_conn_reservation();
             close(tgt_fd);
             close(cli_fd);
             continue;
@@ -1589,7 +1690,6 @@ void* listener_thread(void* arg) {
         g_state.connections[conn_idx].rule_id = rule->id;
         g_state.connections[conn_idx].backend_idx = backend_idx;
         g_state.connections[conn_idx].start_time = spf_time_sec();
-        g_state.active_conns++;
         g_state.total_conns++;
         pthread_mutex_unlock(&g_state.stats_lock);
         
@@ -1818,6 +1918,10 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 "  PAUSE <id>         - stop accepting for rule\n"
                 "  RESUME <id>        - resume accepting for rule\n"
                 "  DRAIN <id> <idx> [sec] - drain backend index\n"
+                "  SETRATE <id> <bps> - set per-rule rate limit\n"
+                "  SETMAXCONNS <id> <n> - set per-rule max concurrent conns\n"
+                "  SETGLOBALMAXCONNS <n> - set global max active conns\n"
+                "  EMERGENCY ON|OFF - block/allow new data-plane accepts\n"
                 "  SETWEIGHT <id> <idx> <w> - set backend weight\n"
                 "  SETSTATE <id> <idx> <UP|DOWN|DRAIN> - set backend state\n"
                 "  ADMINALLOWLIST     - list admin allowlist\n"
@@ -1842,6 +1946,7 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 "  LOGS [n]           - recent events\n"
                 "  METRICS            - prometheus\n"
                 "  TLSINFO            - tls control plane details\n"
+                "  AUDITVERIFY        - verify tamper-evident audit chain\n"
                 "  QUIT               - close\n");
         }
         else if (strncmp(buf, "STATUS", 6) == 0) {
@@ -1865,6 +1970,8 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 "Temp Access Grants Created: %lu\n"
                 "Service Token Max TTL: %u sec\n"
                 "Temp Grant Max TTL: %u sec\n"
+                "Global Max Conns: %u\n"
+                "Emergency Mode: %s\n"
                 "Session Role: %s\n",
                 SPF_VERSION,
                 up/3600, (up%3600)/60, up%60,
@@ -1883,6 +1990,8 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 g_state.admin_temp_grants_created,
                 g_state.config.admin.service_token_max_ttl_sec,
                 g_state.config.admin.temp_grant_max_ttl_sec,
+                g_state.global_max_conns,
+                g_state.emergency_mode ? "ON" : "OFF",
                 role == ADMIN_ROLE_ADMIN ? "admin" : (role == ADMIN_ROLE_READONLY ? "readonly" : "none"));
         }
         else if (strncmp(buf, "RULES", 5) == 0) {
@@ -2056,6 +2165,68 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 }
             } else {
                 snprintf(resp, sizeof(resp), "ERR usage: DRAIN <id> <idx> [seconds]\n");
+            }
+        }
+        else if (strncmp(buf, "SETRATE ", 8) == 0) {
+            uint32_t id = 0;
+            uint64_t bps = 0;
+            char id_s[32] = {0};
+            char bps_s[32] = {0};
+            if (sscanf(buf + 8, "%31s %31s", id_s, bps_s) == 2 &&
+                parse_u32_strict(id_s, &id) &&
+                parse_u64_strict(bps_s, &bps)) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                if (!r) {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                } else if (bps == 0 || rule_set_rate_limit(r, bps) != 0) {
+                    snprintf(resp, sizeof(resp), "ERR invalid rate\n");
+                } else {
+                    snprintf(resp, sizeof(resp), "OK rate set rule=%u bps=%" PRIu64 "\n", id, bps);
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: SETRATE <id> <bps>\n");
+            }
+        }
+        else if (strncmp(buf, "SETMAXCONNS ", 12) == 0) {
+            uint32_t id = 0;
+            uint32_t maxc = 0;
+            if (sscanf(buf + 12, "%u %u", &id, &maxc) == 2) {
+                spf_rule_t* r = spf_get_rule(&g_state, id);
+                if (!r) {
+                    snprintf(resp, sizeof(resp), "ERR rule not found\n");
+                } else if (rule_set_max_conns(r, maxc) != 0) {
+                    snprintf(resp, sizeof(resp), "ERR failed to set max conns\n");
+                } else {
+                    snprintf(resp, sizeof(resp), "OK max conns set rule=%u max=%u\n", id, maxc);
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: SETMAXCONNS <id> <n>\n");
+            }
+        }
+        else if (strncmp(buf, "SETGLOBALMAXCONNS ", 18) == 0) {
+            uint32_t maxc = 0;
+            if (parse_u32_strict(buf + 18, &maxc)) {
+                pthread_mutex_lock(&g_state.stats_lock);
+                g_state.global_max_conns = maxc;
+                pthread_mutex_unlock(&g_state.stats_lock);
+                snprintf(resp, sizeof(resp), "OK global max conns=%u\n", maxc);
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: SETGLOBALMAXCONNS <n>\n");
+            }
+        }
+        else if (strncmp(buf, "EMERGENCY ", 10) == 0) {
+            if (strncmp(buf + 10, "ON", 2) == 0) {
+                pthread_mutex_lock(&g_state.stats_lock);
+                g_state.emergency_mode = true;
+                pthread_mutex_unlock(&g_state.stats_lock);
+                snprintf(resp, sizeof(resp), "OK emergency mode enabled\n");
+            } else if (strncmp(buf + 10, "OFF", 3) == 0) {
+                pthread_mutex_lock(&g_state.stats_lock);
+                g_state.emergency_mode = false;
+                pthread_mutex_unlock(&g_state.stats_lock);
+                snprintf(resp, sizeof(resp), "OK emergency mode disabled\n");
+            } else {
+                snprintf(resp, sizeof(resp), "ERR usage: EMERGENCY ON|OFF\n");
             }
         }
         else if (strncmp(buf, "SETWEIGHT ", 10) == 0) {
@@ -2428,6 +2599,8 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 "idle_timeout_sec=%u\n"
                 "service_token_max_ttl_sec=%u\n"
                 "temp_grant_max_ttl_sec=%u\n"
+                "global_max_conns=%u\n"
+                "emergency_mode=%s\n"
                 "audit_log=%s\n"
                 "staged_changes=%u\n",
                 g_state.config.admin.tls_enabled ? "true" : "false",
@@ -2440,8 +2613,23 @@ void handle_ctrl(int fd, SSL* ssl, const char* remote_ip) {
                 g_state.config.admin.idle_timeout_sec,
                 g_state.config.admin.service_token_max_ttl_sec,
                 g_state.config.admin.temp_grant_max_ttl_sec,
+                g_state.global_max_conns,
+                g_state.emergency_mode ? "true" : "false",
                 g_state.config.admin.audit_log_path[0] ? g_state.config.admin.audit_log_path : "(disabled)",
                 g_state.staged_change_count);
+        }
+        else if (strncmp(buf, "AUDITVERIFY", 11) == 0) {
+            uint32_t checked = 0;
+            uint32_t failures = 0;
+            int rc = spf_audit_verify_chain(&g_state, &checked, &failures);
+            if (rc == 0) {
+                snprintf(resp, sizeof(resp), "OK audit chain verified entries=%u\n", checked);
+            } else {
+                pthread_mutex_lock(&g_state.stats_lock);
+                g_state.audit_verify_failures++;
+                pthread_mutex_unlock(&g_state.stats_lock);
+                snprintf(resp, sizeof(resp), "ERR audit verification failed entries=%u failures=%u\n", checked, failures);
+            }
         }
         else if (strncmp(buf, "BLOCK ", 6) == 0) {
             char ip[64] = {0};

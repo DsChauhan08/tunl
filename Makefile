@@ -73,7 +73,7 @@ endif
 CFLAGS += -MMD -MP $(OPENSSL_CFLAGS)
 CXXFLAGS += -MMD -MP $(OPENSSL_CFLAGS)
 
-.PHONY: all clean install uninstall check help debug release test-smoke test-cli install-man uninstall-man package-deb package-rpm package-all
+.PHONY: all clean install uninstall check help debug release test-smoke test-cli install-man uninstall-man package-deb package-rpm package-all asan ubsan sanitizers test-asan test-ubsan
 
 all: $(BIN_DIR)/$(TARGET)
 
@@ -198,11 +198,23 @@ test: $(BIN_DIR)/$(TARGET)
 
 test-smoke: $(BIN_DIR)/$(TARGET)
 	@echo "Running integration smoke tests..."
-	@python3 tests/integration_smoke.py
+	@SPF_BIN="$(CURDIR)/$(BIN_DIR)/$(TARGET)" python3 tests/integration_smoke.py
 
 test-cli: $(BIN_DIR)/$(TARGET)
 	@echo "Running real-world CLI tests..."
-	@bash tests/cli_realworld.sh
+	@SPF_BIN="$(CURDIR)/$(BIN_DIR)/$(TARGET)" bash tests/cli_realworld.sh
+
+test-asan:
+	@$(MAKE) clean
+	@$(MAKE) BUILD_MODE=debug CC=clang CXX=clang++ CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=address -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=address -fno-omit-frame-pointer" LDFLAGS="-fsanitize=address" TARGET=spf-asan
+	@ASAN_OPTIONS="detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1" SPF_BIN="$(CURDIR)/$(BIN_DIR)/spf-asan" $(MAKE) BUILD_MODE=debug TARGET=spf-asan test-smoke
+	@ASAN_OPTIONS="detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1" SPF_BIN="$(CURDIR)/$(BIN_DIR)/spf-asan" $(MAKE) BUILD_MODE=debug TARGET=spf-asan test-cli
+
+test-ubsan:
+	@$(MAKE) clean
+	@$(MAKE) BUILD_MODE=debug CC=clang CXX=clang++ CFLAGS="$(COMMON_CFLAGS) $(DEBUG_CFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" CXXFLAGS="$(COMMON_CXXFLAGS) $(DEBUG_CXXFLAGS) -fsanitize=undefined -fno-omit-frame-pointer" LDFLAGS="-fsanitize=undefined" TARGET=spf-ubsan
+	@UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" SPF_BIN="$(CURDIR)/$(BIN_DIR)/spf-ubsan" $(MAKE) BUILD_MODE=debug TARGET=spf-ubsan test-smoke
+	@UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" SPF_BIN="$(CURDIR)/$(BIN_DIR)/spf-ubsan" $(MAKE) BUILD_MODE=debug TARGET=spf-ubsan test-cli
 
 fuzz-ctrl:
 	@echo "Building control parser fuzz harness..."
@@ -304,6 +316,12 @@ help:
 	@echo "  make install-deps-*    - Install for your distro"
 	@echo "  make install-deps-suse - Install deps on openSUSE"
 	@echo "  make install-deps-alpine - Install deps on Alpine"
+	@echo ""
+	@echo "Sanitizers:"
+	@echo "  make asan             - Build ASAN binary"
+	@echo "  make ubsan            - Build UBSAN binary"
+	@echo "  make test-asan        - Build + run tests under ASAN"
+	@echo "  make test-ubsan       - Build + run tests under UBSAN"
 	@echo ""
 	@echo "Packaging:"
 	@echo "  make package-deb      - Build local .deb package"

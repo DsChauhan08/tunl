@@ -237,6 +237,11 @@ TOKENDEL <id>             # revoke service token
 ACCESSGRANT <ip> [ttl]    # temporary allowlist grant for admin plane
 ACCESSGRANTS              # list temporary allowlist grants
 ACCESSREVOKE <ip>         # revoke temporary allowlist grant
+SETRATE <id> <bps>        # set per-rule byte rate limit
+SETMAXCONNS <id> <n>      # set per-rule concurrent connection cap
+SETGLOBALMAXCONNS <n>     # set global concurrent connection cap
+EMERGENCY ON|OFF          # immediate kill-switch for new dataplane accepts
+AUDITVERIFY               # verify tamper-evident audit chain
 TLSINFO                   # show TLS + admin security posture
 BLOCK <ip> [seconds]      # block IP
 UNBLOCK <ip>              # unblock IP  
@@ -306,6 +311,14 @@ From self-hosted community pain points (cost/lock-in, repeated MFA prompts, and 
 
 This gives teams several capabilities typically bundled in paid tunnel/control platforms, while keeping deployment self-hostable.
 
+### Additional enterprise controls added
+
+- **Emergency kill-switch** (`EMERGENCY ON|OFF`) for instant containment.
+- **Per-rule and global connection caps** (`SETMAXCONNS`, `SETGLOBALMAXCONNS`) for blast-radius control.
+- **Live rule rate tuning** (`SETRATE`) for abuse throttling without restarts.
+- **Audit chain verification** (`AUDITVERIFY`) to detect tampering.
+- **Expanded security telemetry counters** for failed/sensitive/unknown commands and backend TLS failure classes.
+
 ## Backend TLS Verification and Pinning
 
 Per-backend TLS to upstream targets supports:
@@ -374,6 +387,18 @@ spf_rules_active          # active rules
 spf_admin_service_token_auth_success_total
 spf_admin_service_token_auth_fail_total
 spf_admin_temp_grants_created_total
+spf_admin_failed_commands_total
+spf_admin_unknown_commands_total
+spf_admin_sensitive_commands_total
+spf_backend_tls_handshake_failures_total
+spf_backend_tls_pin_failures_total
+spf_backend_connect_timeouts_total
+spf_conn_reject_emergency_total
+spf_conn_reject_rule_max_total
+spf_conn_reject_global_max_total
+spf_audit_verify_failures_total
+spf_global_max_conns
+spf_emergency_mode
 ```
 
 ## ESP32 Support

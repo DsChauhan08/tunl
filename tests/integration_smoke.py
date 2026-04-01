@@ -42,7 +42,7 @@ def assert_true(cond, msg):
 
 def main():
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    spf_bin = os.path.join(root, "bin", "spf")
+    spf_bin = os.environ.get("SPF_BIN", os.path.join(root, "bin", "spf"))
     backend_py = os.path.join(root, "fast_backend.py")
 
     assert_true(os.path.exists(spf_bin), "spf binary missing")
